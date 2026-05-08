@@ -58,6 +58,8 @@
 - Added an Inno Setup installer script, installer build wrapper, installer output ignore rule, and clean-PC installer test notes.
 - Added saved Host target presets in the Ping Panel.
 - Added Report CSV export with structured rows for Speed Test history, Speed Targets, traceroute hops, and Network Scanner results.
+- Installed Inno Setup 6.7.1 locally, generated `installer_output\PingerAppSetup-0.1.0.exe`, and smoke-tested the packaged EXE.
+- Updated the installer wrapper to find winget's per-user Inno Setup install location and moved the Inno architecture identifier to `x64compatible`.
 
 ## 2026-05-07
 

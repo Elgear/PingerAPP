@@ -39,8 +39,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 ## Next Features
 
 1. Packaging
-   - Test packaged build on a clean Windows PC.
-   - Build and test the Inno Setup installer on a clean Windows PC.
+   - Test the Inno Setup installer on a clean Windows PC or VM.
 
 ## Completed Tool Milestones
 
@@ -67,8 +66,9 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 - Build includes LibreSpeed CLI license and attribution files.
 - Build includes bundled `tools/iperf3/iperf3.exe`, `tools/iperf3/cygwin1.dll`, and related license files.
 - Inno Setup installer script and build wrapper are in place.
-- Test a packaged build on a clean Windows PC.
-- Build and test the Inno Setup installer on a clean Windows PC.
+- Local Inno Setup installer build has been generated successfully.
+- Packaged EXE has been smoke-tested after the latest build.
+- Test the Inno Setup installer on a clean Windows PC or VM.
 
 ## Refactor Plan
 

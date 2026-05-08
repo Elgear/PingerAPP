@@ -94,7 +94,7 @@ To rebuild the PyInstaller output and then build the installer:
 .\scripts\build_installer.ps1 -BuildApp
 ```
 
-The script looks for `ISCC.exe` on `PATH` and in the default Inno Setup 6 install locations. If Inno Setup is installed somewhere else, pass the compiler path:
+The script looks for `ISCC.exe` on `PATH`, in the winget per-user install location, and in the default Inno Setup 6 machine install locations. If Inno Setup is installed somewhere else, pass the compiler path:
 
 ```powershell
 .\scripts\build_installer.ps1 -InnoSetupCompiler "C:\Path\To\ISCC.exe"
@@ -104,6 +104,12 @@ The installer output is written to:
 
 ```text
 installer_output\PingerAppSetup-0.1.0.exe
+```
+
+The local installer build has been verified with Inno Setup 6.7.1. The latest generated installer hash was:
+
+```text
+SHA256 D6DEBCC685E6B1DA27A2B6766FE65D0F19DC20AE87369F42DDB6DCCDECAA3AB1
 ```
 
 The installer copies the full `dist\PingerApp` folder, adds a Start Menu shortcut, offers an optional desktop shortcut, and copies `README.md` plus `THIRD_PARTY_NOTICES.md` to the install root.
