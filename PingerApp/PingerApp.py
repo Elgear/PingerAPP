@@ -369,6 +369,7 @@ class PingerApp(QWidget):
         self.speedtest_progress_timer = None
         self.speedtest_progress_elapsed_ms = 0
         self.speedtest_progress_total_ms = 0
+        self.speedtest_history_loaded = False
 
         # §3.A.a Host input & Start/Pause controls
         self.host_input = QLineEdit("8.8.8.8")
@@ -1141,6 +1142,7 @@ class PingerApp(QWidget):
             layout.addWidget(history_group)
 
             self.speedtest_window.setLayout(layout)
+            self._load_speedtest_history()
 
         self.speedtest_window.layout().activate()
         self.speedtest_window.adjustSize()
@@ -1352,6 +1354,10 @@ class PingerApp(QWidget):
         except ValueError:
             return str(value)
 
+    def _speedtest_history_path(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+        return os.path.join(root, "data", "speedtest_history.json")
+
     def _dict_get_any(self, data: dict, *keys):
         for key in keys:
             if key in data and data[key] not in (None, ""):
@@ -1415,12 +1421,54 @@ class PingerApp(QWidget):
             values["server"],
             values["data_used"],
         ]
+        self._insert_speedtest_history_row(row_values)
+        self._save_speedtest_history()
+
+    def _insert_speedtest_history_row(self, row_values):
         self.speedtest_history_table.insertRow(0)
         for col, value in enumerate(row_values):
             self.speedtest_history_table.setItem(0, col, QTableWidgetItem(value))
 
-        while self.speedtest_history_table.rowCount() > 20:
+        while self.speedtest_history_table.rowCount() > 10:
             self.speedtest_history_table.removeRow(self.speedtest_history_table.rowCount() - 1)
+
+    def _speedtest_history_rows(self):
+        if self.speedtest_history_table is None:
+            return []
+        rows = []
+        for row in range(self.speedtest_history_table.rowCount()):
+            values = []
+            for col in range(self.speedtest_history_table.columnCount()):
+                item = self.speedtest_history_table.item(row, col)
+                values.append(item.text() if item is not None else "")
+            rows.append(values)
+        return rows
+
+    def _load_speedtest_history(self):
+        if self.speedtest_history_loaded or self.speedtest_history_table is None:
+            return
+        self.speedtest_history_loaded = True
+        path = self._speedtest_history_path()
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                rows = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        if not isinstance(rows, list):
+            return
+        for row_values in reversed(rows[:10]):
+            if isinstance(row_values, list) and len(row_values) == self.speedtest_history_table.columnCount():
+                self._insert_speedtest_history_row([str(value) for value in row_values])
+
+    def _save_speedtest_history(self):
+        path = self._speedtest_history_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(self._speedtest_history_rows()[:10], handle, indent=2)
+        except OSError:
+            pass
 
     def _set_speedtest_error(self, message: str):
         self._stop_speedtest_progress(reset=True)
