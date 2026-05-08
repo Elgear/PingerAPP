@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-05-08
+
+- Reviewed Ookla Speedtest CLI redistribution terms and documented that PingerApp should not bundle the CLI binary by default.
+- Updated packaging notes to prefer detecting an installed Speedtest CLI and guiding users to Ookla's official download page.
+
 ## 2026-05-07
 
 - Deferred raw ICMP socket creation until ping start and added socket cleanup on stop/close.

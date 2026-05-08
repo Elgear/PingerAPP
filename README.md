@@ -15,13 +15,15 @@ Raw ICMP ping can require elevated network privileges on some systems. If the ap
 
 ## Optional Speed Test CLI
 
-The Speed Test window uses the official Ookla Speedtest CLI when available. Put the Windows binary at:
+The Speed Test window uses the official Ookla Speedtest CLI when available. For development-only local testing, the app can discover the Windows binary at:
 
 ```text
 tools/speedtest/speedtest.exe
 ```
 
-The app also falls back to `speedtest` on `PATH`. Do not commit or redistribute the Ookla binary until its EULA/redistribution terms are reviewed for the intended use.
+The app also falls back to `speedtest` on `PATH`.
+
+Do not commit or redistribute the Ookla binary with PingerApp. Ookla's CLI notices limit use to personal, non-commercial command-line use, and Ookla's public terms restrict redistribution unless expressly permitted. The preferred packaging approach is to detect an installed Speedtest CLI and guide the user to Ookla's official download page.
 
 ## Packaging Notes
 
@@ -29,6 +31,6 @@ For a PC install, package the PyQt app with PyInstaller or a similar tool, then 
 
 - the PingerApp executable and Python runtime bundle,
 - required Python libraries,
-- optional bundled tools such as `tools/speedtest/speedtest.exe` if redistribution is allowed,
+- a Speedtest CLI detection/help flow instead of bundling `tools/speedtest/speedtest.exe`,
 - a Start Menu shortcut,
 - a note that ICMP ping may require elevated permissions depending on the machine.
