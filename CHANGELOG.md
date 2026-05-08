@@ -25,6 +25,7 @@
 - Added Network Scanner stop control, clearer Single host/Subnet target controls with common CIDR sizes, inline control guidance, result filtering, and full-row highlighting for open/live/filtered/closed results.
 - Grouped Network Scanner results by host, carried hostname/MAC identity into port rows, added reverse DNS/ARP/Windows NetBIOS identity lookup, and replaced the wide guidance banner with per-control help buttons.
 - Reworked Network Scanner layout into Target, Scan, and Display groups with one help button per group, named port presets plus exact-port preview, wrapped grouped results, and separate Host State and Port State columns.
+- Moved Network Scanner group help beside section labels and split host summaries into separate Host State and Open Ports columns before per-port details.
 
 ## 2026-05-07
 

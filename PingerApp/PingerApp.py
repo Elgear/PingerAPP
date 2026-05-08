@@ -1571,14 +1571,15 @@ class PingerApp(QWidget):
             self.port_service_probe_check = QCheckBox("Probe service banners")
             self.port_service_probe_check.setToolTip("Best-effort banner, HTTP header, and TLS handshake checks on open ports.")
 
-            target_group = QGroupBox("Target")
+            target_help = (
+                "Choose Single host for one device, or Subnet to discover devices in the selected CIDR range. "
+                "For example, Host 172.16.10.1 with /24 scans 172.16.10.0/24."
+            )
+            target_group = QGroupBox()
             target_layout = QGridLayout()
             target_layout.setHorizontalSpacing(8)
             target_layout.setVerticalSpacing(6)
-            target_layout.addWidget(self._help_button(
-                "Choose Single host for one device, or Subnet to discover devices in the selected CIDR range. "
-                "For example, Host 172.16.10.1 with /24 scans 172.16.10.0/24."
-            ), 0, 5, Qt.AlignRight)
+            target_layout.addWidget(self._help_label("Target", target_help), 0, 0, 1, 6)
             target_layout.addWidget(QLabel("Host"), 1, 0)
             target_layout.addWidget(self.port_host_input, 1, 1)
             target_layout.addWidget(QLabel("Target"), 1, 2)
@@ -1588,16 +1589,17 @@ class PingerApp(QWidget):
             target_layout.setColumnStretch(1, 1)
             target_group.setLayout(target_layout)
 
-            scan_group = QGroupBox("Scan")
-            scan_layout = QGridLayout()
-            scan_layout.setHorizontalSpacing(8)
-            scan_layout.setVerticalSpacing(6)
-            scan_layout.addWidget(self._help_button(
+            scan_help = (
                 "Port presets: Top troubleshooting covers common remote, web, mail, file sharing, and DNS ports. "
                 "Common web scans HTTP/HTTPS alternates. Common remote access checks SSH, Telnet, RDP, and VNC. "
                 "Common mail checks SMTP/POP/IMAP variants. Common network services checks FTP/SSH/Telnet/DNS/NTP/SMB/RDP. "
                 "The preview field shows the exact TCP ports that will be scanned."
-            ), 0, 5, Qt.AlignRight)
+            )
+            scan_group = QGroupBox()
+            scan_layout = QGridLayout()
+            scan_layout.setHorizontalSpacing(8)
+            scan_layout.setVerticalSpacing(6)
+            scan_layout.addWidget(self._help_label("Scan", scan_help), 0, 0, 1, 6)
             scan_layout.addWidget(QLabel("Port preset"), 1, 0)
             scan_layout.addWidget(self.port_ports_combo, 1, 1, 1, 5)
             scan_layout.addWidget(QLabel("Ports scanned"), 2, 0)
@@ -1610,14 +1612,15 @@ class PingerApp(QWidget):
             scan_layout.setColumnStretch(1, 1)
             scan_group.setLayout(scan_layout)
 
-            display_group = QGroupBox("Display")
+            display_help = (
+                "Results are grouped by host. Host State only shows whether the host was discovered. "
+                "Open Ports summarizes open port numbers for the host. Port State is shown on each child port row."
+            )
+            display_group = QGroupBox()
             display_layout = QGridLayout()
             display_layout.setHorizontalSpacing(8)
             display_layout.setVerticalSpacing(6)
-            display_layout.addWidget(self._help_button(
-                "Results are grouped by host. Host State summarizes whether the host was found and how many ports are open. "
-                "Port State is shown on each child port row. Use the filter to focus on open, filtered, or closed results."
-            ), 0, 3, Qt.AlignRight)
+            display_layout.addWidget(self._help_label("Display", display_help), 0, 0, 1, 4)
             display_layout.addWidget(QLabel("Filter"), 1, 0)
             display_layout.addWidget(self.port_filter_combo, 1, 1)
             display_layout.addWidget(self.port_run_btn, 1, 2)
@@ -1647,8 +1650,8 @@ class PingerApp(QWidget):
             layout.addWidget(self.port_progress_bar)
 
             self.port_table = QTreeWidget()
-            self.port_table.setColumnCount(9)
-            self.port_table.setHeaderLabels(["Host", "Hostname", "Host State", "MAC", "Port", "Service", "Port State", "Latency", "Details"])
+            self.port_table.setColumnCount(10)
+            self.port_table.setHeaderLabels(["Host", "Hostname", "Host State", "MAC", "Open Ports", "Port", "Service", "Port State", "Latency", "Details"])
             self.port_table.setRootIsDecorated(True)
             self.port_table.setAlternatingRowColors(True)
             self.port_table.setSelectionBehavior(QTreeWidget.SelectRows)
@@ -1663,7 +1666,8 @@ class PingerApp(QWidget):
             ph.setSectionResizeMode(5, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(6, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-            ph.setSectionResizeMode(8, QHeaderView.Stretch)
+            ph.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(9, QHeaderView.Stretch)
             layout.addWidget(self.port_table, 1)
             self.port_window.setLayout(layout)
 
@@ -1789,7 +1793,7 @@ class PingerApp(QWidget):
         max_workers = self.port_concurrency_spin.value() if self.port_concurrency_spin is not None else 64
         detect_services = self.port_service_probe_check is not None and self.port_service_probe_check.isChecked()
         self.port_table.clear()
-        self.port_table.setHeaderLabels(["Host", "Hostname", "Host State", "MAC", "Port", "Service", "Port State", "Latency", "Details"])
+        self.port_table.setHeaderLabels(["Host", "Hostname", "Host State", "MAC", "Open Ports", "Port", "Service", "Port State", "Latency", "Details"])
         self.port_scan_results = []
         self.port_host_items = {}
         self.port_host_summaries = {}
@@ -1887,7 +1891,7 @@ class PingerApp(QWidget):
         if self.port_table is None:
             return
         self.port_table.clear()
-        self.port_table.setHeaderLabels(["Host", "Hostname", "Host State", "MAC", "Port", "Service", "Port State", "Latency", "Details"])
+        self.port_table.setHeaderLabels(["Host", "Hostname", "Host State", "MAC", "Open Ports", "Port", "Service", "Port State", "Latency", "Details"])
         self.port_host_items = {}
         self.port_host_summaries = {}
         for result in self.port_scan_results:
@@ -1901,6 +1905,7 @@ class PingerApp(QWidget):
             "mac": result.get("mac", "N/A"),
             "alive": False,
             "open": 0,
+            "open_ports": [],
             "closed": 0,
             "filtered": 0,
             "unreachable": 0,
@@ -1929,22 +1934,25 @@ class PingerApp(QWidget):
         if item is None or summary is None:
             return
         scanned = summary["open"] + summary["closed"] + summary["filtered"] + summary["unreachable"] + summary["other"]
-        state_parts = []
-        if summary["alive"]:
-            state_parts.append("Host Up")
+        state = "Host Up" if summary["alive"] else "Host"
         if scanned:
-            state_parts.append(f"{summary['open']}/{scanned} open")
-        state = ", ".join(state_parts) or "Host"
+            if summary["open_ports"]:
+                port_summary = f"{summary['open']}/{scanned} open: {', '.join(summary['open_ports'])}"
+            else:
+                port_summary = f"0/{scanned} open"
+        else:
+            port_summary = ""
         latency = "N/A" if summary["latency"] is None else f"{summary['latency']:.1f} ms"
         item.setText(0, host)
         item.setText(1, summary["hostname"])
         item.setText(2, state)
         item.setText(3, summary["mac"])
-        item.setText(4, "")
+        item.setText(4, port_summary)
         item.setText(5, "")
         item.setText(6, "")
-        item.setText(7, latency)
-        item.setText(8, summary["details"])
+        item.setText(7, "")
+        item.setText(8, latency)
+        item.setText(9, summary["details"])
         if summary["open"]:
             self._apply_tree_item_style(item, "Open")
         elif summary["alive"]:
@@ -1958,7 +1966,7 @@ class PingerApp(QWidget):
         host = result.get("host", "")
         if host in self.port_host_items:
             return self.port_host_items[host]
-        item = QTreeWidgetItem(["", "", "", "", "", "", "", "", ""])
+        item = QTreeWidgetItem(["", "", "", "", "", "", "", "", "", ""])
         self.port_table.addTopLevelItem(item)
         self.port_host_items[host] = item
         self.port_host_summaries[host] = self._blank_host_summary(result)
@@ -1984,6 +1992,9 @@ class PingerApp(QWidget):
         if status == "Open":
             summary["alive"] = True
             summary["open"] += 1
+            port_text = str(result.get("port", ""))
+            if port_text and port_text not in summary["open_ports"]:
+                summary["open_ports"].append(port_text)
         elif status == "Closed":
             summary["alive"] = True
             summary["closed"] += 1
@@ -1995,6 +2006,7 @@ class PingerApp(QWidget):
             summary["other"] += 1
 
         child = QTreeWidgetItem([
+            "",
             "",
             "",
             "",
