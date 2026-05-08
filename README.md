@@ -15,6 +15,12 @@ Raw ICMP ping can require elevated network privileges on some systems. If the ap
 
 Host Info includes local hostname, local IP, first-hop gateway, public IP, public ISP, and primary MAC address. ISP metadata is looked up with a timeout-bound public IP metadata request and falls back to `N/A` if unavailable.
 
+The right-side Tools panel opens separate diagnostic windows:
+
+- DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.
+- Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
+- Alerts: threshold alert log.
+
 ## LibreSpeed Speed Test
 
 The Speed Test window uses the bundled open-source LibreSpeed CLI at:

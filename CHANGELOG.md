@@ -15,6 +15,9 @@
 - Changed the Speed Test progress bar to update once per second against the configured test duration.
 - Added LibreSpeed runtime overhead to the Speed Test progress estimate so the bar better matches total wall-clock runtime.
 - Persisted the last 10 Speed Test history rows to local runtime data.
+- Replaced embedded DNS and Traceroute side panels with Tools launcher buttons and separate DNS / WHOIS and Traceroute diagnostic windows.
+- Expanded DNS / WHOIS with selectable record lookups, reverse lookup, and optional IP/ASN/ISP metadata.
+- Expanded Traceroute with target, max-hop, timeout, structured hop table, and raw output controls.
 
 ## 2026-05-07
 

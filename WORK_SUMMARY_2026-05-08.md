@@ -26,6 +26,9 @@
 - Auto-loaded the LibreSpeed server list on Speed Test open and added clearer handling for selected servers that return no result.
 - Added public ISP lookup, hostname, and primary MAC address to Host Info, and reused the ISP lookup in Speed Test results when LibreSpeed omits ISP data.
 - Persisted the last 10 Speed Test history rows to local runtime data.
+- Replaced embedded DNS and Traceroute side panels with Tools launcher buttons and separate DNS / WHOIS and Traceroute diagnostic windows.
+- Expanded DNS / WHOIS with record lookup, reverse lookup, and optional IP/ASN/ISP metadata.
+- Expanded Traceroute with target, max-hop, timeout, structured hop table, and raw output controls.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 

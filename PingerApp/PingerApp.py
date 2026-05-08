@@ -120,12 +120,17 @@ class TracerouteWorker(QThread):
     """Runs tracert/traceroute in background and emits each line."""
     line_ready = pyqtSignal(str)
 
-    def __init__(self, host: str):
+    def __init__(self, host: str, max_hops=30, timeout_ms=4000):
         super().__init__()
         self.host = host
+        self.max_hops = max_hops
+        self.timeout_ms = timeout_ms
 
     def run(self):
-        cmd = ["tracert", self.host] if platform.system()=="Windows" else ["traceroute", self.host]
+        if platform.system() == "Windows":
+            cmd = ["tracert", "-h", str(self.max_hops), "-w", str(self.timeout_ms), self.host]
+        else:
+            cmd = ["traceroute", "-m", str(self.max_hops), "-w", str(max(1, int(self.timeout_ms / 1000))), self.host]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
         for line in proc.stdout:
@@ -178,6 +183,94 @@ class DnsLookupWorker(QThread):
             self.result_ready.emit("\n".join(ips))
         except socket.gaierror:
             self.error_ready.emit(f"Cannot resolve {self.query}")
+
+
+class DnsWhoisWorker(QThread):
+    """Runs expanded DNS and IP ownership diagnostics in the background."""
+    result_ready = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, query: str, record_type: str, include_ip_info=True):
+        super().__init__()
+        self.query = query
+        self.record_type = record_type
+        self.include_ip_info = include_ip_info
+
+    def _is_ip(self):
+        try:
+            socket.inet_aton(self.query)
+            return True
+        except OSError:
+            return False
+
+    def _run_nslookup(self):
+        cmd = ["nslookup", f"-type={self.record_type}", self.query]
+        try:
+            kwargs = {"capture_output": True, "text": True, "timeout": 20}
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return f"nslookup failed: {e}"
+
+        output = (completed.stdout or completed.stderr or "").strip()
+        return output or "No nslookup output."
+
+    def _ip_info(self, ip):
+        if not ip or ip == "N/A":
+            return "N/A"
+        try:
+            with urllib.request.urlopen(f"https://ipwho.is/{ip}", timeout=5) as r:
+                data = json.loads(r.read().decode())
+        except Exception as e:
+            return f"IP info lookup failed: {e}"
+
+        connection = data.get("connection", {}) or {}
+        lines = [
+            f"IP: {data.get('ip', ip)}",
+            f"ISP: {connection.get('isp') or connection.get('org') or 'N/A'}",
+            f"ASN: {connection.get('asn') or 'N/A'}",
+            f"Org: {connection.get('org') or 'N/A'}",
+            f"Location: {', '.join(part for part in (data.get('city'), data.get('region'), data.get('country')) if part) or 'N/A'}",
+            "Source: ipwho.is",
+        ]
+        return "\n".join(lines)
+
+    def run(self):
+        if not self.query:
+            self.error_ready.emit("Enter a hostname or IP address.")
+            return
+
+        sections = [f"Query: {self.query}"]
+        is_ip = self._is_ip()
+
+        if is_ip:
+            try:
+                sections.append("Reverse DNS:\n" + socket.gethostbyaddr(self.query)[0])
+            except socket.herror:
+                sections.append("Reverse DNS:\nN/A")
+            if self.include_ip_info:
+                sections.append("IP / ASN / ISP:\n" + self._ip_info(self.query))
+        else:
+            try:
+                _, aliases, ips = socket.gethostbyname_ex(self.query)
+                forward_lines = [f"Aliases: {', '.join(aliases) if aliases else 'N/A'}", f"IPv4: {', '.join(ips) if ips else 'N/A'}"]
+                try:
+                    ipv6 = sorted({
+                        item[4][0] for item in socket.getaddrinfo(self.query, None, socket.AF_INET6)
+                    })
+                    forward_lines.append(f"IPv6: {', '.join(ipv6) if ipv6 else 'N/A'}")
+                except socket.gaierror:
+                    forward_lines.append("IPv6: N/A")
+                sections.append("Forward DNS:\n" + "\n".join(forward_lines))
+                if self.include_ip_info and ips:
+                    sections.append("Primary IP / ASN / ISP:\n" + self._ip_info(ips[0]))
+            except socket.gaierror:
+                sections.append("Forward DNS:\nN/A")
+
+            sections.append(f"{self.record_type} Records:\n" + self._run_nslookup())
+
+        self.result_ready.emit("\n\n".join(sections))
 
 
 class StartResolveWorker(QThread):
@@ -363,7 +456,9 @@ class PingerApp(QWidget):
         self._ping_sock = None
         self.host_info_worker = None
         self.dns_worker = None
+        self.dns_whois_worker = None
         self.start_worker = None
+        self.tr_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
         self.speedtest_progress_timer = None
@@ -395,7 +490,13 @@ class PingerApp(QWidget):
         self.dns_btn.clicked.connect(self.do_dns_lookup)
         self.dns_result_box = QTextEdit()
         self.dns_result_box.setReadOnly(True)
-        self.dns_result_box.setFixedHeight(60)
+        self.dns_record_combo = None
+        self.dns_ip_info_check = None
+        self.dns_window = None
+        self.dns_tool_btn = QPushButton("DNS / WHOIS")
+        self.dns_tool_btn.setFixedSize(135, 30)
+        self.dns_tool_btn.setToolTip("Open DNS, record, and IP ownership lookup")
+        self.dns_tool_btn.clicked.connect(self.show_dns_window)
 
         # §3.A.c Live displays: latency, elapsed time, reverse DNS
         self.live_latency    = QLineEdit("Idle")
@@ -572,6 +673,15 @@ class PingerApp(QWidget):
         # §3.A.j Traceroute table
         self.tr_button = QPushButton("Run Traceroute")
         self.tr_button.clicked.connect(self.start_traceroute)
+        self.trace_window = None
+        self.trace_tool_btn = QPushButton("Traceroute")
+        self.trace_tool_btn.setFixedSize(135, 30)
+        self.trace_tool_btn.setToolTip("Open traceroute diagnostics")
+        self.trace_tool_btn.clicked.connect(self.show_traceroute_window)
+        self.trace_input = None
+        self.trace_max_hops_spin = None
+        self.trace_timeout_spin = None
+        self.trace_raw_box = None
         self.tr_table  = QTableWidget(0,4)
         self.tr_table.setHorizontalHeaderLabels(["Hop","IP","Host","Latency"])
         self.tr_table.verticalHeader().setVisible(False)
@@ -847,34 +957,19 @@ class PingerApp(QWidget):
 
         # §3.B.h Right pane: DNS & Traceroute
         right = QVBoxLayout()
-        dns_group = QGroupBox("DNS Lookup")
-        dns_group.setSizePolicy(QSizePolicy.Fixed,QSizePolicy.Fixed)
-        dns_group.setFixedWidth(360)
-        dv = QVBoxLayout(); dh = QHBoxLayout()
-        self.dns_input.setFixedSize(260,30); dh.addWidget(self.dns_input)
-        self.dns_btn.setFixedSize(70,30);      dh.addWidget(self.dns_btn)
-        dv.addLayout(dh); dv.addWidget(self.dns_result_box)
-        dns_group.setLayout(dv)
-        right.addWidget(dns_group)
+        tools_group = QGroupBox("Tools")
+        tools_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        tools_group.setFixedWidth(360)
+        tools_layout = QVBoxLayout()
+        tools_layout.setContentsMargins(8,8,8,8)
+        tools_layout.setSpacing(10)
+        tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
+        tools_group.setLayout(tools_layout)
+        right.addWidget(tools_group)
 
-        trace_group = QGroupBox("Traceroute")
-        trace_group.setSizePolicy(QSizePolicy.Fixed,QSizePolicy.Expanding)
-        trace_group.setFixedWidth(360)
-        tv = QVBoxLayout()
-        tv.addWidget(self.tr_button)
-        tv.addWidget(self.trace_target_label)
-        tv.addWidget(self.tr_table)
-        trace_group.setLayout(tv)
-        right.addWidget(trace_group, 1)
-
-        alerts_group = QGroupBox("Alert Log")
-        alerts_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        alerts_group.setFixedWidth(360)
-        alerts_h = QHBoxLayout()
-        alerts_h.setContentsMargins(8,8,8,8)
-        alerts_h.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
-        alerts_group.setLayout(alerts_h)
-        right.addWidget(alerts_group)
+        right.addStretch(1)
 
         content = QHBoxLayout()
         content.addLayout(left, 1)
@@ -991,6 +1086,100 @@ class PingerApp(QWidget):
         label.setStyleSheet(
             f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 3px; padding: 2px 4px; }}"
         )
+
+    def show_dns_window(self):
+        """Open the DNS / WHOIS diagnostic window."""
+        if self.dns_window is None:
+            self.dns_window = QWidget(None, Qt.Window)
+            self.dns_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.dns_window.setWindowTitle("DNS / WHOIS")
+            self.dns_window.setMinimumSize(720, 520)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.dns_input.setMinimumWidth(360)
+            if not self.dns_input.text().strip():
+                self.dns_input.setText(self.host_input.text().strip())
+            self.dns_btn.setText("Run Lookup")
+            self.dns_btn.setMinimumHeight(30)
+            self.dns_record_combo = QComboBox()
+            self.dns_record_combo.addItems(["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "ANY"])
+            self.dns_ip_info_check = QCheckBox("Include IP / ASN / ISP")
+            self.dns_ip_info_check.setChecked(True)
+
+            controls.addWidget(QLabel("Query"), 0, 0)
+            controls.addWidget(self.dns_input, 0, 1)
+            controls.addWidget(QLabel("Record"), 0, 2)
+            controls.addWidget(self.dns_record_combo, 0, 3)
+            controls.addWidget(self.dns_btn, 0, 4)
+            controls.addWidget(self.dns_ip_info_check, 1, 1, 1, 3)
+            controls.setColumnStretch(1, 1)
+            layout.addLayout(controls)
+
+            self.dns_result_box.setMinimumHeight(390)
+            self.dns_result_box.setPlaceholderText("DNS, record, and IP ownership results will appear here.")
+            layout.addWidget(self.dns_result_box, 1)
+            self.dns_window.setLayout(layout)
+
+        self.dns_window.show()
+        self.dns_window.raise_()
+        self.dns_window.activateWindow()
+
+    def show_traceroute_window(self):
+        """Open the traceroute diagnostic window."""
+        if self.trace_window is None:
+            self.trace_window = QWidget(None, Qt.Window)
+            self.trace_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.trace_window.setWindowTitle("Traceroute")
+            self.trace_window.setMinimumSize(760, 560)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.trace_input = QLineEdit(self.host_input.text().strip())
+            self.trace_input.setMinimumWidth(360)
+            self.trace_max_hops_spin = QSpinBox()
+            self.trace_max_hops_spin.setRange(1, 64)
+            self.trace_max_hops_spin.setValue(30)
+            self.trace_timeout_spin = QSpinBox()
+            self.trace_timeout_spin.setRange(500, 10000)
+            self.trace_timeout_spin.setSingleStep(500)
+            self.trace_timeout_spin.setValue(4000)
+            self.trace_timeout_spin.setSuffix(" ms")
+
+            controls.addWidget(QLabel("Target"), 0, 0)
+            controls.addWidget(self.trace_input, 0, 1)
+            controls.addWidget(QLabel("Max hops"), 0, 2)
+            controls.addWidget(self.trace_max_hops_spin, 0, 3)
+            controls.addWidget(QLabel("Timeout"), 0, 4)
+            controls.addWidget(self.trace_timeout_spin, 0, 5)
+            controls.addWidget(self.tr_button, 0, 6)
+            controls.setColumnStretch(1, 1)
+            layout.addLayout(controls)
+
+            layout.addWidget(self.trace_target_label)
+            layout.addWidget(self.tr_table, 2)
+            self.trace_raw_box = QTextEdit()
+            self.trace_raw_box.setReadOnly(True)
+            self.trace_raw_box.setMinimumHeight(120)
+            self.trace_raw_box.setPlaceholderText("Raw traceroute output will appear here.")
+            layout.addWidget(self.trace_raw_box, 1)
+            self.trace_window.setLayout(layout)
+
+        if self.trace_input is not None and not self.trace_input.text().strip():
+            self.trace_input.setText(self.host_input.text().strip())
+        self.trace_window.show()
+        self.trace_window.raise_()
+        self.trace_window.activateWindow()
 
     def _log_alert(self, title: str, message: str):
         """Append a timestamped monitoring alert without blocking the UI."""
@@ -1617,22 +1806,24 @@ class PingerApp(QWidget):
             axis.xaxis.grid(True, which='major', linewidth=0.2)
 
     def do_dns_lookup(self):
-        """Resolve input as IP (reverse) or hostname (forward)."""
+        """Run expanded DNS/IP ownership lookup."""
         hostname = self.dns_input.text().strip()
         if not hostname:
             return
-        if self.dns_worker is not None and self.dns_worker.isRunning():
+        if self.dns_whois_worker is not None and self.dns_whois_worker.isRunning():
             return
 
         self.dns_btn.setEnabled(False)
-        self.dns_result_box.setPlainText("Resolving...")
-        self.dns_worker = DnsLookupWorker(hostname)
-        self.dns_worker.result_ready.connect(self._set_dns_result)
-        self.dns_worker.error_ready.connect(self._show_dns_error)
-        self.dns_worker.finished.connect(lambda: self.dns_btn.setEnabled(True))
-        self.dns_worker.finished.connect(self.dns_worker.deleteLater)
-        self.dns_worker.finished.connect(lambda: setattr(self, "dns_worker", None))
-        self.dns_worker.start()
+        self.dns_result_box.setPlainText("Running lookup...")
+        record_type = self.dns_record_combo.currentText() if self.dns_record_combo is not None else "A"
+        include_ip_info = self.dns_ip_info_check.isChecked() if self.dns_ip_info_check is not None else True
+        self.dns_whois_worker = DnsWhoisWorker(hostname, record_type, include_ip_info)
+        self.dns_whois_worker.result_ready.connect(self._set_dns_result)
+        self.dns_whois_worker.error_ready.connect(self._show_dns_error)
+        self.dns_whois_worker.finished.connect(lambda: self.dns_btn.setEnabled(True))
+        self.dns_whois_worker.finished.connect(self.dns_whois_worker.deleteLater)
+        self.dns_whois_worker.finished.connect(lambda: setattr(self, "dns_whois_worker", None))
+        self.dns_whois_worker.start()
 
     def _set_dns_result(self, result: str):
         self.dns_result_box.setPlainText(result)
@@ -1789,7 +1980,7 @@ class PingerApp(QWidget):
 
     def do_ping(self):
         """Perform a single ping, update metrics, compute jitter, redraw."""
-        host = self.host_input.text().strip()
+        host = self.trace_input.text().strip() if self.trace_input is not None else self.host_input.text().strip()
         try:
             latency = ping3.ping(host, unit="ms")
         except OSError as e:
@@ -2070,13 +2261,22 @@ class PingerApp(QWidget):
         self._update_trace_target_label(host)
         self.tr_button.setEnabled(False)
         self.tr_table.setRowCount(0)
-        self.tr_worker = TracerouteWorker(host)
+        if self.trace_raw_box is not None:
+            self.trace_raw_box.clear()
+            self.trace_raw_box.append(f"Running traceroute to {host}...")
+        max_hops = self.trace_max_hops_spin.value() if self.trace_max_hops_spin is not None else 30
+        timeout_ms = self.trace_timeout_spin.value() if self.trace_timeout_spin is not None else 4000
+        self.tr_worker = TracerouteWorker(host, max_hops=max_hops, timeout_ms=timeout_ms)
         self.tr_worker.line_ready.connect(self.handle_trace_line)
         self.tr_worker.finished.connect(lambda: self.tr_button.setEnabled(True))
+        self.tr_worker.finished.connect(self.tr_worker.deleteLater)
+        self.tr_worker.finished.connect(lambda: setattr(self, "tr_worker", None))
         self.tr_worker.start()
 
     def handle_trace_line(self, line: str):
         """§3.D.i Append each traceroute hop to table."""
+        if self.trace_raw_box is not None:
+            self.trace_raw_box.append(line)
         m = re.match(r'\s*(\d+)', line)
         if not m:
             return
