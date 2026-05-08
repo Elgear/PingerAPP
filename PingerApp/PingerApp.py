@@ -374,6 +374,58 @@ def format_bytes_decimal(value):
             return f"{size:.2f} {unit}" if unit != "B" else f"{size:.0f} {unit}"
         size /= 1000
 
+def format_count(value):
+    if value is None:
+        return "N/A"
+    return f"{int(float(value)):,}"
+
+def format_packet_rate(value):
+    if value is None:
+        return "N/A"
+    return f"{float(value):.1f} packets/s"
+
+def format_interface_traffic(bytes_value=None, packets_value=None, bytes_rate=None, packets_rate=None):
+    if bytes_value is not None or packets_value is not None:
+        return f"{format_bytes_decimal(bytes_value)}; {format_count(packets_value)} packets"
+    if bytes_rate is not None or packets_rate is not None:
+        return f"{format_bytes_decimal(bytes_rate)}/s; {format_packet_rate(packets_rate)}"
+    return "N/A"
+
+def interface_counter_diagnosis(info):
+    source = str(info.get("counter_source") or "N/A")
+    if source.startswith("Unavailable"):
+        return (
+            f"Interface counters are unavailable ({source}). Try running the app as Administrator if Windows blocks "
+            "adapter statistics on this PC."
+        )
+
+    raw_values = {
+        "receive errors": info.get("rx_errors_raw"),
+        "transmit errors": info.get("tx_errors_raw"),
+        "receive discards": info.get("rx_discards_raw"),
+        "transmit discards": info.get("tx_discards_raw"),
+    }
+    alerts = []
+    for label, value in raw_values.items():
+        try:
+            numeric = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0:
+            alerts.append(f"{label}: {numeric:,}")
+
+    source_note = ""
+    if "performance counters" in source.lower():
+        source_note = " Traffic is shown as a current rate because per-adapter totals need elevated Windows access."
+
+    if alerts:
+        return (
+            "Interface counters show non-zero " + ", ".join(alerts) + ". "
+            "Receive errors/discards can point to cable, port, adapter, driver, or congestion problems; compare these "
+            "after a refresh or during a speed test to see whether they are increasing." + source_note
+        )
+    return "Interface error and discard counters look clean for the selected adapter." + source_note
+
 def lan_throughput_diagnosis(bits_per_second):
     if bits_per_second is None:
         return "No throughput result was available. Check that iperf3 ran successfully and the server was reachable."
@@ -500,6 +552,13 @@ class AdapterInfoWorker(QThread):
                 "dns_servers": "N/A",
                 "mac": get_primary_mac(),
                 "interface_index": "N/A",
+                "counter_source": "Unavailable on this operating system",
+                "rx_traffic": "N/A",
+                "tx_traffic": "N/A",
+                "rx_errors": "N/A",
+                "tx_errors": "N/A",
+                "rx_discards": "N/A",
+                "tx_discards": "N/A",
                 "diagnosis": "Detailed adapter link speed checks are currently implemented for Windows.",
             })
             return
@@ -515,6 +574,73 @@ class AdapterInfoWorker(QThread):
     def _windows_adapter_info(self):
         script = r"""
 $ErrorActionPreference = "Stop"
+function Get-ObjValue($obj, [string]$name) {
+    if (-not $obj) { return $null }
+    $prop = $obj.PSObject.Properties[$name]
+    if ($prop) { return $prop.Value }
+    return $null
+}
+function Sum-ObjValues($obj, [string[]]$names) {
+    $total = 0
+    $found = $false
+    foreach ($name in $names) {
+        $value = Get-ObjValue $obj $name
+        if ($null -ne $value) {
+            $total += [double]$value
+            $found = $true
+        }
+    }
+    if ($found) { return $total }
+    return $null
+}
+function Normalize-Key([string]$value) {
+    if (-not $value) { return "" }
+    return (($value.ToLowerInvariant()) -replace "[^a-z0-9]", "")
+}
+function Get-PerfCounterMap([string]$adapterName, [string]$adapterDescription) {
+    try {
+        $counterPaths = @(
+            "\Network Interface(*)\Bytes Received/sec",
+            "\Network Interface(*)\Bytes Sent/sec",
+            "\Network Interface(*)\Packets Received/sec",
+            "\Network Interface(*)\Packets Sent/sec",
+            "\Network Interface(*)\Packets Received Errors",
+            "\Network Interface(*)\Packets Outbound Errors",
+            "\Network Interface(*)\Packets Received Discarded",
+            "\Network Interface(*)\Packets Outbound Discarded"
+        )
+        $samples = (Get-Counter $counterPaths -MaxSamples 1 -ErrorAction Stop).CounterSamples
+    } catch {
+        return $null
+    }
+
+    $groups = @{}
+    foreach ($sample in $samples) {
+        if ($sample.Path -notmatch "\\network interface\((?<instance>.+)\)\\(?<counter>[^\\]+)$") { continue }
+        $instance = $Matches.instance
+        $counter = $Matches.counter.ToLowerInvariant()
+        $key = Normalize-Key $instance
+        if (-not $groups.ContainsKey($key)) {
+            $groups[$key] = [ordered]@{
+                Instance = $instance
+                InstanceKey = $key
+                Counters = @{}
+            }
+        }
+        $groups[$key].Counters[$counter] = [double]$sample.CookedValue
+    }
+
+    $descriptionKey = Normalize-Key $adapterDescription
+    $nameKey = Normalize-Key $adapterName
+    $matches = @($groups.Values | Where-Object {
+        $_.InstanceKey -eq $descriptionKey -or
+        $_.InstanceKey -eq $nameKey -or
+        ($descriptionKey -and ($_.InstanceKey.Contains($descriptionKey) -or $descriptionKey.Contains($_.InstanceKey))) -or
+        ($nameKey -and ($_.InstanceKey.Contains($nameKey) -or $nameKey.Contains($_.InstanceKey)))
+    })
+    if ($matches.Count -gt 0) { return $matches[0].Counters }
+    return $null
+}
 $configs = Get-NetIPConfiguration |
     Where-Object { $_.IPv4Address -and $_.NetAdapter -and $_.NetAdapter.Status -eq "Up" } |
     Sort-Object @{Expression={ if ($_.IPv4DefaultGateway) { 0 } else { 1 } }}, InterfaceMetric
@@ -526,6 +652,25 @@ $items = foreach ($cfg in $configs) {
     $duplex = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName -match "Speed.*Duplex|Duplex" } |
         Select-Object -First 1
+    $stats = $null
+    $statsError = $null
+    try {
+        $stats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction Stop
+    } catch {
+        $statsError = $_.Exception.Message
+    }
+    $perf = $null
+    if (-not $stats) {
+        $perf = Get-PerfCounterMap $adapter.Name $adapter.InterfaceDescription
+    }
+    $counterSource = "Unavailable"
+    if ($stats) {
+        $counterSource = "Get-NetAdapterStatistics"
+    } elseif ($perf) {
+        $counterSource = "Windows performance counters"
+    } elseif ($statsError) {
+        $counterSource = "Unavailable: $statsError"
+    }
 
     [pscustomobject]@{
         Adapter = $adapter.Name
@@ -540,6 +685,19 @@ $items = foreach ($cfg in $configs) {
         Mac = $adapter.MacAddress
         InterfaceIndex = $cfg.InterfaceIndex
         HasGateway = [bool]$cfg.IPv4DefaultGateway
+        CounterSource = $counterSource
+        RxBytes = Get-ObjValue $stats "ReceivedBytes"
+        TxBytes = Get-ObjValue $stats "SentBytes"
+        RxPackets = Sum-ObjValues $stats @("ReceivedUnicastPackets", "ReceivedMulticastPackets", "ReceivedBroadcastPackets", "ReceivedPackets")
+        TxPackets = Sum-ObjValues $stats @("SentUnicastPackets", "SentMulticastPackets", "SentBroadcastPackets", "SentPackets")
+        RxBytesPerSec = if ($perf) { $perf["bytes received/sec"] } else { $null }
+        TxBytesPerSec = if ($perf) { $perf["bytes sent/sec"] } else { $null }
+        RxPacketsPerSec = if ($perf) { $perf["packets received/sec"] } else { $null }
+        TxPacketsPerSec = if ($perf) { $perf["packets sent/sec"] } else { $null }
+        RxErrors = if ($stats) { Get-ObjValue $stats "ReceivedPacketErrors" } elseif ($perf) { $perf["packets received errors"] } else { $null }
+        TxErrors = if ($stats) { Get-ObjValue $stats "OutboundPacketErrors" } elseif ($perf) { $perf["packets outbound errors"] } else { $null }
+        RxDiscards = if ($stats) { Get-ObjValue $stats "ReceivedDiscardedPackets" } elseif ($perf) { $perf["packets received discarded"] } else { $null }
+        TxDiscards = if ($stats) { Get-ObjValue $stats "OutboundDiscardedPackets" } elseif ($perf) { $perf["packets outbound discarded"] } else { $null }
     }
 }
 
@@ -592,8 +750,33 @@ $items | ConvertTo-Json -Depth 4 -Compress
             "dns_servers": dns_text or "N/A",
             "mac": str(selected.get("Mac") or "N/A"),
             "interface_index": str(selected.get("InterfaceIndex") or "N/A"),
+            "counter_source": str(selected.get("CounterSource") or "Unavailable"),
+            "rx_traffic": format_interface_traffic(
+                selected.get("RxBytes"),
+                selected.get("RxPackets"),
+                selected.get("RxBytesPerSec"),
+                selected.get("RxPacketsPerSec"),
+            ),
+            "tx_traffic": format_interface_traffic(
+                selected.get("TxBytes"),
+                selected.get("TxPackets"),
+                selected.get("TxBytesPerSec"),
+                selected.get("TxPacketsPerSec"),
+            ),
+            "rx_errors": format_count(selected.get("RxErrors")),
+            "tx_errors": format_count(selected.get("TxErrors")),
+            "rx_discards": format_count(selected.get("RxDiscards")),
+            "tx_discards": format_count(selected.get("TxDiscards")),
+            "rx_errors_raw": selected.get("RxErrors"),
+            "tx_errors_raw": selected.get("TxErrors"),
+            "rx_discards_raw": selected.get("RxDiscards"),
+            "tx_discards_raw": selected.get("TxDiscards"),
         }
-        info["diagnosis"] = adapter_link_diagnosis(link_speed, connection_type, info["status"])
+        info["diagnosis"] = (
+            adapter_link_diagnosis(link_speed, connection_type, info["status"])
+            + "\n\n"
+            + interface_counter_diagnosis(info)
+        )
         return info
 
 
@@ -3232,7 +3415,7 @@ class PingerApp(QWidget):
             self.adapter_window = QWidget(None, Qt.Window)
             self.adapter_window.setAttribute(Qt.WA_DeleteOnClose, False)
             self.adapter_window.setWindowTitle("Adapter Info")
-            self.adapter_window.setMinimumSize(760, 540)
+            self.adapter_window.setMinimumSize(820, 680)
 
             layout = QVBoxLayout()
             layout.setContentsMargins(12,12,12,12)
@@ -3288,6 +3471,38 @@ class PingerApp(QWidget):
             details.setColumnStretch(1, 1)
             details_group.setLayout(details)
             layout.addWidget(details_group)
+
+            counters_group = QGroupBox("Interface Counters")
+            counters = QGridLayout()
+            counters.setContentsMargins(10,10,10,10)
+            counters.setHorizontalSpacing(12)
+            counters.setVerticalSpacing(8)
+            counter_fields = [
+                ("counter_source", "Source"),
+                ("rx_traffic", "Received"),
+                ("tx_traffic", "Sent"),
+                ("rx_errors", "Receive Errors"),
+                ("tx_errors", "Transmit Errors"),
+                ("rx_discards", "Receive Discards"),
+                ("tx_discards", "Transmit Discards"),
+            ]
+            for row, (key, label_text) in enumerate(counter_fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.adapter_labels[key] = value
+                counters.addWidget(name, row // 2, (row % 2) * 2)
+                counters.addWidget(value, row // 2, (row % 2) * 2 + 1)
+            counters.setColumnStretch(1, 1)
+            counters.setColumnStretch(3, 1)
+            counters_group.setLayout(counters)
+            layout.addWidget(counters_group)
 
             diagnosis_group = QGroupBox("Diagnosis")
             diagnosis_layout = QVBoxLayout()
@@ -3354,6 +3569,13 @@ class PingerApp(QWidget):
             "dns_servers": "N/A",
             "mac": get_primary_mac(),
             "interface_index": "N/A",
+            "counter_source": "Unavailable",
+            "rx_traffic": "N/A",
+            "tx_traffic": "N/A",
+            "rx_errors": "N/A",
+            "tx_errors": "N/A",
+            "rx_discards": "N/A",
+            "tx_discards": "N/A",
             "diagnosis": (
                 f"{message}\n\n"
                 "The app could not read Windows adapter link-speed data. "
@@ -4823,10 +5045,11 @@ class PingerApp(QWidget):
         <h2>Tools</h2>
         <h3>Adapter Info</h3>
         <ul>
-            <li>Shows the active Windows adapter, status, connection type, link speed, duplex setting, IPv4, gateway, DNS servers, MAC address, and interface index.</li>
+            <li>Shows the active Windows adapter, status, connection type, link speed, duplex setting, IPv4, gateway, DNS servers, MAC address, interface index, and interface counters.</li>
             <li><b>Link Speed</b> is the negotiated local connection rate between this PC and the connected router, switch, access point, dock, or adapter.</li>
             <li>If Link Speed is <code>100 Mbps</code>, speed tests cannot reach gigabit speeds from this PC. Check cable, wall socket, switch/router port, USB dock, adapter settings, and auto-negotiation.</li>
             <li>If Link Speed is <code>1 Gbps</code> or faster but internet speed is near 100 Mbps, check router WAN/LAN port speed, ISP profile, speed test server, or congestion.</li>
+            <li><b>Receive/Transmit Errors</b> and <b>Discards</b> should normally stay at zero or stop increasing. Increasing values during tests can indicate cable, port, NIC, driver, or congestion issues.</li>
             <li>For Wi-Fi, link rate is not the same as real throughput. Signal, band, channel width, interference, and access point capability matter.</li>
         </ul>
 
@@ -5101,6 +5324,17 @@ class PingerApp(QWidget):
             ("Interface Index", "interface_index"),
         ]
         lines = [f"{label}: {self._label_text(self.adapter_labels.get(key))}" for label, key in rows]
+        counter_rows = [
+            ("Counter Source", "counter_source"),
+            ("Received", "rx_traffic"),
+            ("Sent", "tx_traffic"),
+            ("Receive Errors", "rx_errors"),
+            ("Transmit Errors", "tx_errors"),
+            ("Receive Discards", "rx_discards"),
+            ("Transmit Discards", "tx_discards"),
+        ]
+        lines.extend(["", "Interface Counters:"])
+        lines.extend(f"{label}: {self._label_text(self.adapter_labels.get(key))}" for label, key in counter_rows)
         if self.adapter_diagnosis_box is not None:
             diagnosis = self.adapter_diagnosis_box.toPlainText().strip()
             if diagnosis:

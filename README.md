@@ -18,7 +18,7 @@ Host Info includes local hostname, local IP, first-hop gateway, public IP, publi
 The right-side Tools panel opens separate diagnostic windows:
 
 - Speed Test: LibreSpeed-based internet speed test with persistent history.
-- Adapter Info: active adapter link speed, status, type, IP, gateway, DNS, MAC, duplex setting where available, and diagnosis for 100 Mbps vs gigabit negotiation.
+- Adapter Info: active adapter link speed, status, type, IP, gateway, DNS, MAC, duplex setting where available, interface error/discard counters where Windows exposes them, and diagnosis for 100 Mbps vs gigabit negotiation or suspicious counters.
 - LAN Throughput: bundled iperf3 client/server tool for testing local network throughput separately from internet speed.
 - Gateway Stability: repeated first-hop ping monitor for gateway latency, packet loss, jitter, and spikes.
 - Loaded Latency: bufferbloat check that compares idle ping latency with latency while LibreSpeed load is running.
