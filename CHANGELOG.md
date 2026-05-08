@@ -20,6 +20,7 @@
 - Expanded Traceroute with target, max-hop, timeout, structured hop table, and raw output controls.
 - Moved Speed Test from the Ping Panel into the Tools launcher.
 - Added a Port Check tool window for TCP connectivity checks across one or more ports with latency and error details.
+- Upgraded Port Check into a safe TCP Port Scanner with presets, port ranges, service names, progress, and open-only display.
 
 ## 2026-05-07
 

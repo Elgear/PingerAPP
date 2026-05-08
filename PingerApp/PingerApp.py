@@ -84,6 +84,12 @@ def first_available(*values):
             return value
     return "N/A"
 
+def service_name(port):
+    try:
+        return socket.getservbyport(int(port), "tcp")
+    except OSError:
+        return "unknown"
+
 def get_default_gateway():
     """Return LAN gateway by parsing system route tables."""
     try:
@@ -277,6 +283,7 @@ class DnsWhoisWorker(QThread):
 class PortCheckWorker(QThread):
     """Checks TCP connectivity for one or more ports without blocking the UI."""
     result_ready = pyqtSignal(dict)
+    progress_ready = pyqtSignal(int, int)
 
     def __init__(self, host: str, ports: list, timeout_ms=3000):
         super().__init__()
@@ -286,7 +293,7 @@ class PortCheckWorker(QThread):
 
     def run(self):
         timeout_seconds = max(0.1, self.timeout_ms / 1000)
-        for port in self.ports:
+        for index, port in enumerate(self.ports, start=1):
             started = time.perf_counter()
             status = "Closed"
             error = ""
@@ -303,10 +310,12 @@ class PortCheckWorker(QThread):
             self.result_ready.emit({
                 "host": self.host,
                 "port": port,
+                "service": service_name(port),
                 "status": status,
                 "latency": latency,
                 "error": error,
             })
+            self.progress_ready.emit(index, len(self.ports))
 
 
 class StartResolveWorker(QThread):
@@ -541,7 +550,11 @@ class PingerApp(QWidget):
         self.port_run_btn = None
         self.port_status_label = None
         self.port_table = None
-        self.port_tool_btn = QPushButton("Port Check")
+        self.port_open_only_check = None
+        self.port_progress_bar = None
+        self.port_scan_result_count = 0
+        self.port_scan_open_count = 0
+        self.port_tool_btn = QPushButton("Port Scanner")
         self.port_tool_btn.setFixedSize(135, 30)
         self.port_tool_btn.setToolTip("Open TCP port connectivity checks")
         self.port_tool_btn.clicked.connect(self.show_port_check_window)
@@ -1134,8 +1147,8 @@ class PingerApp(QWidget):
         if self.port_window is None:
             self.port_window = QWidget(None, Qt.Window)
             self.port_window.setAttribute(Qt.WA_DeleteOnClose, False)
-            self.port_window.setWindowTitle("Port Check")
-            self.port_window.setMinimumSize(700, 460)
+            self.port_window.setWindowTitle("Port Scanner")
+            self.port_window.setMinimumSize(760, 520)
 
             layout = QVBoxLayout()
             layout.setContentsMargins(12,12,12,12)
@@ -1149,23 +1162,24 @@ class PingerApp(QWidget):
             self.port_ports_combo = QComboBox()
             self.port_ports_combo.setEditable(True)
             self.port_ports_combo.addItems([
-                "80,443",
+                "Common web: 80,443,8080,8443",
+                "Common remote: 22,23,3389,5900",
+                "Common mail: 25,110,143,465,587,993,995",
+                "Common network: 21,22,23,53,80,123,139,443,445,3389",
+                "Top troubleshooting: 20-23,25,53,80,110,139,143,443,445,587,993,995,3389,5900,8080,8443",
                 "443",
                 "80",
-                "22",
-                "3389",
-                "53",
-                "25,587,993",
-                "8080,8443",
+                "1-1024",
             ])
-            self.port_ports_combo.setMinimumWidth(160)
+            self.port_ports_combo.setMinimumWidth(300)
             self.port_timeout_spin = QSpinBox()
             self.port_timeout_spin.setRange(250, 30000)
             self.port_timeout_spin.setSingleStep(250)
             self.port_timeout_spin.setValue(3000)
             self.port_timeout_spin.setSuffix(" ms")
-            self.port_run_btn = QPushButton("Run Check")
+            self.port_run_btn = QPushButton("Run Scan")
             self.port_run_btn.clicked.connect(self.start_port_check)
+            self.port_open_only_check = QCheckBox("Show open only")
 
             controls.addWidget(QLabel("Host"), 0, 0)
             controls.addWidget(self.port_host_input, 0, 1)
@@ -1173,6 +1187,7 @@ class PingerApp(QWidget):
             controls.addWidget(self.port_ports_combo, 0, 3)
             controls.addWidget(QLabel("Timeout"), 1, 0)
             controls.addWidget(self.port_timeout_spin, 1, 1)
+            controls.addWidget(self.port_open_only_check, 1, 2)
             controls.addWidget(self.port_run_btn, 1, 3)
             controls.setColumnStretch(1, 1)
             layout.addLayout(controls)
@@ -1185,8 +1200,14 @@ class PingerApp(QWidget):
             )
             layout.addWidget(self.port_status_label)
 
-            self.port_table = QTableWidget(0, 5)
-            self.port_table.setHorizontalHeaderLabels(["Host", "Port", "Status", "Latency", "Error"])
+            self.port_progress_bar = QProgressBar()
+            self.port_progress_bar.setRange(0, 100)
+            self.port_progress_bar.setValue(0)
+            self.port_progress_bar.setFormat("Ready")
+            layout.addWidget(self.port_progress_bar)
+
+            self.port_table = QTableWidget(0, 6)
+            self.port_table.setHorizontalHeaderLabels(["Host", "Port", "Service", "Status", "Latency", "Error"])
             self.port_table.verticalHeader().setVisible(False)
             self.port_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self.port_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1195,7 +1216,8 @@ class PingerApp(QWidget):
             ph.setSectionResizeMode(1, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(2, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-            ph.setSectionResizeMode(4, QHeaderView.Stretch)
+            ph.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(5, QHeaderView.Stretch)
             layout.addWidget(self.port_table, 1)
             self.port_window.setLayout(layout)
 
@@ -1206,6 +1228,8 @@ class PingerApp(QWidget):
         self.port_window.activateWindow()
 
     def _parse_port_list(self, text: str):
+        if ":" in text:
+            text = text.split(":", 1)[1]
         ports = []
         for part in re.split(r"[,;\s]+", text.strip()):
             if not part:
@@ -1227,7 +1251,7 @@ class PingerApp(QWidget):
                 deduped.append(port)
         if not deduped:
             raise ValueError("Enter at least one port.")
-        return deduped[:50]
+        return deduped[:1024]
 
     def start_port_check(self):
         """Run TCP connectivity checks in the Port Check window."""
@@ -1246,8 +1270,13 @@ class PingerApp(QWidget):
 
         timeout_ms = self.port_timeout_spin.value() if self.port_timeout_spin is not None else 3000
         self.port_table.setRowCount(0)
+        self.port_scan_result_count = 0
+        self.port_scan_open_count = 0
         self.port_run_btn.setEnabled(False)
-        self.port_status_label.setText(f"Checking {len(ports)} port(s) on {host}...")
+        if self.port_progress_bar is not None:
+            self.port_progress_bar.setValue(0)
+            self.port_progress_bar.setFormat("Scanning... 0%")
+        self.port_status_label.setText(f"Scanning {len(ports)} TCP port(s) on {host}...")
         self.port_status_label.setStyleSheet(
             "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
             "border-radius: 4px; padding: 8px; font-weight: bold; }"
@@ -1255,6 +1284,7 @@ class PingerApp(QWidget):
 
         self.port_check_worker = PortCheckWorker(host, ports, timeout_ms=timeout_ms)
         self.port_check_worker.result_ready.connect(self._add_port_check_result)
+        self.port_check_worker.progress_ready.connect(self._update_port_scan_progress)
         self.port_check_worker.finished.connect(self._finish_port_check)
         self.port_check_worker.finished.connect(self.port_check_worker.deleteLater)
         self.port_check_worker.finished.connect(lambda: setattr(self, "port_check_worker", None))
@@ -1263,10 +1293,20 @@ class PingerApp(QWidget):
     def _add_port_check_result(self, result: dict):
         if self.port_table is None:
             return
+        self.port_scan_result_count += 1
+        if result.get("status") == "Open":
+            self.port_scan_open_count += 1
+        if (
+            self.port_open_only_check is not None
+            and self.port_open_only_check.isChecked()
+            and result.get("status") != "Open"
+        ):
+            return
         latency = "N/A" if result.get("latency") is None else f"{result['latency']:.1f} ms"
         row_values = [
             result.get("host", ""),
             str(result.get("port", "")),
+            result.get("service", ""),
             result.get("status", ""),
             latency,
             result.get("error", ""),
@@ -1275,29 +1315,35 @@ class PingerApp(QWidget):
         self.port_table.insertRow(row)
         for col, value in enumerate(row_values):
             item = QTableWidgetItem(value)
-            if col == 2:
+            if col == 3:
                 if value == "Open":
                     item.setBackground(QBrush(QColor("#e6f4ea")))
                 else:
                     item.setBackground(QBrush(QColor("#fce8e6")))
             self.port_table.setItem(row, col, item)
 
+    def _update_port_scan_progress(self, completed: int, total: int):
+        if self.port_progress_bar is None:
+            return
+        pct = 100 if total <= 0 else int((completed / total) * 100)
+        self.port_progress_bar.setValue(min(100, pct))
+        self.port_progress_bar.setFormat(f"Scanned {completed}/{total} port(s)")
+
     def _finish_port_check(self):
         if self.port_run_btn is not None:
             self.port_run_btn.setEnabled(True)
         if self.port_status_label is not None:
-            open_count = 0
-            total = self.port_table.rowCount() if self.port_table is not None else 0
-            if self.port_table is not None:
-                for row in range(total):
-                    item = self.port_table.item(row, 2)
-                    if item is not None and item.text() == "Open":
-                        open_count += 1
-            self.port_status_label.setText(f"Completed. {open_count}/{total} port(s) open.")
+            suffix = " (open-only view)" if self.port_open_only_check is not None and self.port_open_only_check.isChecked() else ""
+            self.port_status_label.setText(
+                f"Completed. {self.port_scan_open_count}/{self.port_scan_result_count} port(s) open{suffix}."
+            )
             self.port_status_label.setStyleSheet(
                 "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
                 "border-radius: 4px; padding: 8px; font-weight: bold; }"
             )
+        if self.port_progress_bar is not None:
+            self.port_progress_bar.setValue(100)
+            self.port_progress_bar.setFormat("Complete")
 
     def show_dns_window(self):
         """Open the DNS / WHOIS diagnostic window."""

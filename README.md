@@ -18,7 +18,7 @@ Host Info includes local hostname, local IP, first-hop gateway, public IP, publi
 The right-side Tools panel opens separate diagnostic windows:
 
 - Speed Test: LibreSpeed-based internet speed test with persistent history.
-- Port Check: TCP connectivity checks for one or more ports with latency and error details.
+- Port Scanner: safe TCP connect scanning for one or more ports/ranges with presets, service names, progress, latency, and error details.
 - DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.
 - Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
 - Alerts: threshold alert log.
