@@ -46,6 +46,13 @@
 - Added an HTTP Test option to ignore TLS certificate errors for local HTTPS services using self-signed certificates.
 - Added a DNS Compare tool window using `nslookup` to compare System DNS, Cloudflare, Google, and Quad9 answers and response times.
 - Added an MTU Test tool window that probes non-fragmenting ping payload sizes and reports estimated path MTU with raw output details.
+- Added a Report tool with selectable sections, preview, and `.txt` export for Host Info, Adapter Info, ping stats, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results.
+- Added an offline Help window explaining main controls, threshold sliders, monitoring boxes, graphs, diagnostic tools, report generation, and common result meanings.
+- Added an Adapter Info tool for active adapter link speed, connection type, IPv4, gateway, DNS servers, MAC address, duplex setting where available, and 100 Mbps vs gigabit diagnosis.
+- Added Adapter Info to the Report tool and Help documentation.
+- Added a LAN Throughput tool using bundled iperf3 client/server mode to test local network speed separately from internet speed.
+- Added LAN Throughput to the Report tool, Help documentation, README, and packaging notes.
+- Bundled iperf3 3.21 for Windows x64 with Cygwin runtime DLL, checksums, source records, and license notices.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
@@ -59,6 +66,10 @@
 - Speed Test opens in a separate window from the top Ping Panel button.
 - Speed Test uses the bundled LibreSpeed CLI at `tools/librespeed/librespeed-cli.exe`, with `librespeed-cli` on PATH as a fallback.
 - Speed Test can auto-select a server or use a refreshed LibreSpeed server list for manual selection.
+- Report opens from the Tools launcher and can save a plain text troubleshooting snapshot.
+- Help opens from the Tools launcher and provides built-in offline documentation.
+- Adapter Info opens from the Tools launcher and helps identify local 100 Mbps link negotiation before blaming ISP speed.
+- LAN Throughput opens from the Tools launcher and uses bundled `tools/iperf3/iperf3.exe`, with `iperf3` on PATH as a fallback.
 
 ## Verification Used
 
@@ -74,6 +85,7 @@ python -m py_compile PingerApp\PingerApp.py check_qt.py
 ## Open Decisions
 
 - Make sure the bundled LibreSpeed CLI and license files are included in the installer.
+- Make sure bundled iperf3 runtime and license files are included in the installer.
 - Decide installer approach for Windows PCs.
 - Decide whether the app should require administrator privileges for raw ICMP ping or use another ping backend.
 
@@ -82,6 +94,7 @@ python -m py_compile PingerApp\PingerApp.py check_qt.py
 - Create a PyInstaller build configuration.
 - Test a packaged build on a clean Windows PC.
 - Add the bundled LibreSpeed CLI and license files to the installer.
+- Add bundled iperf3 runtime and license files to the installer.
 - Split the large `PingerApp.py` file into focused modules once layout and behavior settle.
 - Extract latency, loss, jitter, health, and alert calculations into testable functions.
 - Add saved host presets.

@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QGroupBox, QSlider, QTextEdit,
+    QMessageBox, QFileDialog, QGroupBox, QSlider, QTextEdit,
     QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox, QProgressBar,
     QTreeWidget, QTreeWidgetItem, QToolButton, QToolTip
 )
@@ -303,6 +303,96 @@ def get_local_ip():
     finally:
         s.close()
 
+def parse_link_speed_mbps(value):
+    text = str(value or "").strip().lower().replace(",", "")
+    if not text or text == "n/a":
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([kmgt]?bps)", text)
+    if not match:
+        if text.isdigit():
+            number = float(text)
+            return number / 1_000_000 if number > 100000 else number
+        return None
+    number = float(match.group(1))
+    unit = match.group(2)
+    multipliers = {
+        "kbps": 0.001,
+        "mbps": 1,
+        "gbps": 1000,
+        "tbps": 1000000,
+        "bps": 0.000001,
+    }
+    return number * multipliers.get(unit, 1)
+
+def adapter_link_diagnosis(link_speed, connection_type="", status=""):
+    status_text = str(status or "").strip()
+    if status_text and status_text.lower() != "up":
+        return f"Adapter status is {status_text}. The connection may not be usable until the adapter is up."
+
+    speed_mbps = parse_link_speed_mbps(link_speed)
+    type_text = str(connection_type or "")
+    is_wifi = "wireless" in type_text.lower() or "wi-fi" in type_text.lower() or "wifi" in type_text.lower()
+
+    if speed_mbps is None:
+        return "Link speed is unavailable. Check adapter driver details, Windows adapter status, cable, dock, switch, or router port."
+    if speed_mbps < 100:
+        return f"Link is {link_speed}. This is below Fast Ethernet and will severely cap throughput."
+    if speed_mbps < 1000:
+        return (
+            f"Link is {link_speed}. This can cap speed tests below gigabit. "
+            "Check Ethernet cable pairs, wall socket, switch/router port speed, dock/USB adapter, and NIC auto-negotiation."
+        )
+    if is_wifi:
+        return (
+            f"Wi-Fi link rate is {link_speed}. Real speed tests are usually lower than link rate; "
+            "check band, signal, channel width, interference, and access point capability."
+        )
+    return (
+        f"Link is {link_speed}. Local adapter negotiation looks gigabit or faster. "
+        "If internet speed is around 100 Mbps, check router WAN/LAN ports, ISP profile, speed test server choice, or congestion."
+    )
+
+def format_bits_per_second(value):
+    if value is None:
+        return "N/A"
+    mbps = float(value) / 1_000_000
+    if mbps >= 1000:
+        return f"{mbps / 1000:.2f} Gbps"
+    return f"{mbps:.2f} Mbps"
+
+def format_bytes_decimal(value):
+    if value is None:
+        return "N/A"
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size) < 1000 or unit == "TB":
+            return f"{size:.2f} {unit}" if unit != "B" else f"{size:.0f} {unit}"
+        size /= 1000
+
+def lan_throughput_diagnosis(bits_per_second):
+    if bits_per_second is None:
+        return "No throughput result was available. Check that iperf3 ran successfully and the server was reachable."
+    mbps = float(bits_per_second) / 1_000_000
+    if mbps < 150:
+        return (
+            f"LAN throughput is {mbps:.1f} Mbps. This is consistent with a 100 Mbps local bottleneck. "
+            "Check Ethernet cable pairs, wall sockets, switch/router port speed, dock/USB adapter, and adapter negotiation."
+        )
+    if mbps < 500:
+        return (
+            f"LAN throughput is {mbps:.1f} Mbps. This is above 100 Mbps but below typical gigabit LAN performance. "
+            "Check Wi-Fi conditions, CPU load, powerline adapters, older switches, and parallel traffic."
+        )
+    if mbps < 800:
+        return (
+            f"LAN throughput is {mbps:.1f} Mbps. Local LAN is faster than Fast Ethernet but below a healthy wired gigabit result. "
+            "If this is Wi-Fi, it may be normal; if wired, check cabling, ports, and adapter settings."
+        )
+    return (
+        f"LAN throughput is {mbps:.1f} Mbps. Local LAN path looks gigabit-class. "
+        "If internet Speed Test is near 100 Mbps, focus on router WAN/LAN port speed, ISP profile, speed test server, or congestion."
+    )
+
 
 # §2 ─────────────────────────────────────────────────────────────────────────────
 class TracerouteWorker(QThread):
@@ -345,6 +435,122 @@ class HostInfoWorker(QThread):
             "mac": get_primary_mac(),
             "source": first_available(public_info.get("source")),
         })
+
+
+class AdapterInfoWorker(QThread):
+    """Fetch active adapter and link-speed details without blocking the UI."""
+    info_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def run(self):
+        if platform.system() != "Windows":
+            self.info_ready.emit({
+                "adapter": "N/A",
+                "description": "N/A",
+                "status": "N/A",
+                "connection_type": "N/A",
+                "link_speed": "N/A",
+                "duplex": "N/A",
+                "ipv4": get_local_ip(),
+                "gateway": get_default_gateway(),
+                "dns_servers": "N/A",
+                "mac": get_primary_mac(),
+                "interface_index": "N/A",
+                "diagnosis": "Detailed adapter link speed checks are currently implemented for Windows.",
+            })
+            return
+
+        try:
+            info = self._windows_adapter_info()
+        except Exception as e:
+            self.error_ready.emit(f"Adapter info lookup failed: {e}")
+            return
+
+        self.info_ready.emit(info)
+
+    def _windows_adapter_info(self):
+        script = r"""
+$ErrorActionPreference = "Stop"
+$configs = Get-NetIPConfiguration |
+    Where-Object { $_.IPv4Address -and $_.NetAdapter -and $_.NetAdapter.Status -eq "Up" } |
+    Sort-Object @{Expression={ if ($_.IPv4DefaultGateway) { 0 } else { 1 } }}, InterfaceMetric
+
+$items = foreach ($cfg in $configs) {
+    $adapter = Get-NetAdapter -InterfaceIndex $cfg.InterfaceIndex -ErrorAction SilentlyContinue
+    if (-not $adapter) { continue }
+    $dns = Get-DnsClientServerAddress -InterfaceIndex $cfg.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    $duplex = Get-NetAdapterAdvancedProperty -Name $adapter.Name -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "Speed.*Duplex|Duplex" } |
+        Select-Object -First 1
+
+    [pscustomobject]@{
+        Adapter = $adapter.Name
+        Description = $adapter.InterfaceDescription
+        Status = $adapter.Status
+        ConnectionType = if ($adapter.PhysicalMediaType) { $adapter.PhysicalMediaType.ToString() } elseif ($adapter.MediaType) { $adapter.MediaType.ToString() } else { $null }
+        LinkSpeed = $adapter.LinkSpeed
+        Duplex = if ($duplex) { $duplex.DisplayValue } else { $null }
+        IPv4 = ($cfg.IPv4Address | Select-Object -First 1 -ExpandProperty IPAddress)
+        Gateway = ($cfg.IPv4DefaultGateway | Select-Object -First 1 -ExpandProperty NextHop)
+        DnsServers = @($dns.ServerAddresses)
+        Mac = $adapter.MacAddress
+        InterfaceIndex = $cfg.InterfaceIndex
+        HasGateway = [bool]$cfg.IPv4DefaultGateway
+    }
+}
+
+$items | ConvertTo-Json -Depth 4 -Compress
+"""
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 10,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            **kwargs,
+        )
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(message or "PowerShell returned no adapter data.")
+
+        raw = (completed.stdout or "").strip()
+        if not raw:
+            raise RuntimeError("PowerShell returned no active adapter data.")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list) or not parsed:
+            raise RuntimeError("PowerShell returned no active adapter data.")
+
+        selected = next((item for item in parsed if item.get("HasGateway")), parsed[0])
+        dns_servers = selected.get("DnsServers")
+        if isinstance(dns_servers, list):
+            dns_text = ", ".join(str(value) for value in dns_servers if value)
+        else:
+            dns_text = str(dns_servers or "N/A")
+
+        link_speed = str(selected.get("LinkSpeed") or "N/A")
+        connection_type = str(selected.get("ConnectionType") or "N/A")
+        info = {
+            "adapter": str(selected.get("Adapter") or "N/A"),
+            "description": str(selected.get("Description") or "N/A"),
+            "status": str(selected.get("Status") or "N/A"),
+            "connection_type": connection_type,
+            "link_speed": link_speed,
+            "duplex": str(selected.get("Duplex") or "N/A"),
+            "ipv4": str(selected.get("IPv4") or "N/A"),
+            "gateway": str(selected.get("Gateway") or "N/A"),
+            "dns_servers": dns_text or "N/A",
+            "mac": str(selected.get("Mac") or "N/A"),
+            "interface_index": str(selected.get("InterfaceIndex") or "N/A"),
+        }
+        info["diagnosis"] = adapter_link_diagnosis(link_speed, connection_type, info["status"])
+        return info
 
 
 class DnsLookupWorker(QThread):
@@ -942,6 +1148,85 @@ class SpeedTestWorker(QThread):
         self.result_ready.emit(parsed)
 
 
+class LanThroughputWorker(QThread):
+    """Runs an iperf3 client throughput test in the background."""
+    result_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, executable: str, host: str, port=5201, duration=10, reverse=False):
+        super().__init__()
+        self.executable = executable
+        self.host = host
+        self.port = port
+        self.duration = duration
+        self.reverse = reverse
+
+    def run(self):
+        cmd = [
+            self.executable,
+            "-c", self.host,
+            "-p", str(self.port),
+            "-t", str(self.duration),
+            "-J",
+        ]
+        if self.reverse:
+            cmd.append("-R")
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": max(30, int(self.duration) + 30),
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except FileNotFoundError:
+            self.error_ready.emit("iperf3 executable was not found.")
+            return
+        except subprocess.TimeoutExpired:
+            self.error_ready.emit("LAN throughput test timed out.")
+            return
+        except OSError as e:
+            self.error_ready.emit(f"Could not run iperf3: {e}")
+            return
+
+        output = (completed.stdout or "").strip()
+        if completed.returncode != 0:
+            message = (completed.stderr or output or "iperf3 failed.").strip()
+            self.error_ready.emit(message)
+            return
+
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError:
+            self.error_ready.emit("iperf3 returned output that was not valid JSON.")
+            return
+
+        end = data.get("end", {}) or {}
+        summary = end.get("sum_received") if self.reverse else end.get("sum_sent")
+        if not summary:
+            summary = end.get("sum") or end.get("sum_sent") or end.get("sum_received") or {}
+        bits_per_second = summary.get("bits_per_second")
+        seconds = summary.get("seconds")
+        bytes_transferred = summary.get("bytes")
+        retransmits = summary.get("retransmits")
+
+        result = {
+            "host": self.host,
+            "port": self.port,
+            "duration": self.duration,
+            "direction": "Download from server" if self.reverse else "Upload to server",
+            "bits_per_second": bits_per_second,
+            "throughput": format_bits_per_second(bits_per_second),
+            "seconds": "N/A" if seconds is None else f"{float(seconds):.1f} sec",
+            "transferred": "N/A" if bytes_transferred is None else format_bytes_decimal(bytes_transferred),
+            "retransmits": "N/A" if retransmits is None else str(retransmits),
+            "diagnosis": lan_throughput_diagnosis(bits_per_second),
+            "raw": json.dumps(data, indent=2),
+        }
+        self.result_ready.emit(result)
+
+
 class SpeedTestServerListWorker(QThread):
     """Fetches the LibreSpeed public server list in the background."""
     servers_ready = pyqtSignal(list)
@@ -1113,6 +1398,9 @@ class PingerApp(QWidget):
         self.start_worker = None
         self.tr_worker = None
         self.port_check_worker = None
+        self.adapter_info_worker = None
+        self.lan_throughput_worker = None
+        self.lan_server_process = None
         self.http_test_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
@@ -1457,6 +1745,46 @@ class PingerApp(QWidget):
         self.speedtest_btn.setFixedSize(135, 30)
         self.speedtest_btn.setToolTip("Open internet speed test")
         self.speedtest_btn.clicked.connect(self.show_speedtest_window)
+        self.adapter_window = None
+        self.adapter_labels = {}
+        self.adapter_status_label = None
+        self.adapter_refresh_btn = None
+        self.adapter_diagnosis_box = None
+        self.adapter_info_btn = QPushButton("Adapter Info")
+        self.adapter_info_btn.setFixedSize(135, 30)
+        self.adapter_info_btn.setToolTip("Check active adapter link speed and network settings")
+        self.adapter_info_btn.clicked.connect(self.show_adapter_info_window)
+        self.lan_window = None
+        self.lan_host_input = None
+        self.lan_port_spin = None
+        self.lan_duration_spin = None
+        self.lan_direction_combo = None
+        self.lan_run_btn = None
+        self.lan_server_port_spin = None
+        self.lan_server_start_btn = None
+        self.lan_server_stop_btn = None
+        self.lan_status_label = None
+        self.lan_result_labels = {}
+        self.lan_diagnosis_box = None
+        self.lan_raw_box = None
+        self.lan_last_result = None
+        self.lan_throughput_btn = QPushButton("LAN Throughput")
+        self.lan_throughput_btn.setFixedSize(135, 30)
+        self.lan_throughput_btn.setToolTip("Run iperf3 LAN throughput tests")
+        self.lan_throughput_btn.clicked.connect(self.show_lan_throughput_window)
+        self.report_window = None
+        self.report_checkboxes = {}
+        self.report_preview_box = None
+        self.report_tool_btn = QPushButton("Report")
+        self.report_tool_btn.setFixedSize(135, 30)
+        self.report_tool_btn.setToolTip("Build and save a troubleshooting report")
+        self.report_tool_btn.clicked.connect(self.show_report_window)
+        self.help_window = None
+        self.help_text_box = None
+        self.help_tool_btn = QPushButton("Help")
+        self.help_tool_btn.setFixedSize(135, 30)
+        self.help_tool_btn.setToolTip("Open PingerApp help and field guide")
+        self.help_tool_btn.clicked.connect(self.show_help_window)
 
         # §3.A.k Host-info fields
         self.hostname_label  = QLabel("Loading...")
@@ -1696,6 +2024,8 @@ class PingerApp(QWidget):
         tools_layout.setContentsMargins(8,8,8,8)
         tools_layout.setSpacing(10)
         tools_layout.addWidget(self.speedtest_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.adapter_info_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.lan_throughput_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
@@ -1703,6 +2033,8 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.mtu_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.report_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.help_tool_btn, 0, Qt.AlignCenter)
         tools_group.setLayout(tools_layout)
         right.addWidget(tools_group)
 
@@ -2455,6 +2787,431 @@ class PingerApp(QWidget):
                 self.port_progress_bar.setValue(100)
                 self.port_progress_bar.setFormat("Complete")
 
+    def show_adapter_info_window(self):
+        """Open the active adapter and link speed diagnostic window."""
+        if self.adapter_window is None:
+            self.adapter_window = QWidget(None, Qt.Window)
+            self.adapter_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.adapter_window.setWindowTitle("Adapter Info")
+            self.adapter_window.setMinimumSize(760, 540)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls = QHBoxLayout()
+            self.adapter_refresh_btn = QPushButton("Refresh Adapter Info")
+            self.adapter_refresh_btn.clicked.connect(self.refresh_adapter_info)
+            controls.addWidget(self.adapter_refresh_btn)
+            controls.addStretch(1)
+            layout.addLayout(controls)
+
+            self.adapter_status_label = QLabel("Ready")
+            self.adapter_status_label.setAlignment(Qt.AlignCenter)
+            self.adapter_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.adapter_status_label)
+
+            details_group = QGroupBox("Active Adapter")
+            details = QGridLayout()
+            details.setContentsMargins(10,10,10,10)
+            details.setHorizontalSpacing(12)
+            details.setVerticalSpacing(8)
+            fields = [
+                ("adapter", "Adapter"),
+                ("description", "Description"),
+                ("status", "Status"),
+                ("connection_type", "Type"),
+                ("link_speed", "Link Speed"),
+                ("duplex", "Duplex / Setting"),
+                ("ipv4", "IPv4"),
+                ("gateway", "Gateway"),
+                ("dns_servers", "DNS Servers"),
+                ("mac", "MAC"),
+                ("interface_index", "Interface Index"),
+            ]
+            self.adapter_labels = {}
+            for row, (key, label_text) in enumerate(fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.adapter_labels[key] = value
+                details.addWidget(name, row, 0)
+                details.addWidget(value, row, 1)
+            details.setColumnStretch(1, 1)
+            details_group.setLayout(details)
+            layout.addWidget(details_group)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.adapter_diagnosis_box = QTextEdit()
+            self.adapter_diagnosis_box.setReadOnly(True)
+            self.adapter_diagnosis_box.setMinimumHeight(110)
+            self.adapter_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.adapter_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group, 1)
+
+            self.adapter_window.setLayout(layout)
+
+        self.adapter_window.show()
+        self.adapter_window.raise_()
+        self.adapter_window.activateWindow()
+        self.refresh_adapter_info()
+
+    def refresh_adapter_info(self):
+        if self.adapter_info_worker is not None and self.adapter_info_worker.isRunning():
+            return
+        if self.adapter_refresh_btn is not None:
+            self.adapter_refresh_btn.setEnabled(False)
+        if self.adapter_status_label is not None:
+            self.adapter_status_label.setText("Reading active adapter details...")
+            self.adapter_status_label.setStyleSheet(
+                "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+
+        self.adapter_info_worker = AdapterInfoWorker()
+        self.adapter_info_worker.info_ready.connect(self._set_adapter_info)
+        self.adapter_info_worker.error_ready.connect(self._set_adapter_info_error)
+        self.adapter_info_worker.finished.connect(self._finish_adapter_info)
+        self.adapter_info_worker.finished.connect(self.adapter_info_worker.deleteLater)
+        self.adapter_info_worker.finished.connect(lambda: setattr(self, "adapter_info_worker", None))
+        self.adapter_info_worker.start()
+
+    def _set_adapter_info(self, info: dict):
+        for key, label in self.adapter_labels.items():
+            value = str(info.get(key, "N/A") or "N/A")
+            label.setText(value)
+            label.setToolTip(value)
+        diagnosis = info.get("diagnosis", "N/A")
+        if self.adapter_diagnosis_box is not None:
+            self.adapter_diagnosis_box.setPlainText(diagnosis)
+        if self.adapter_status_label is not None:
+            self.adapter_status_label.setText("Adapter info loaded.")
+            self.adapter_status_label.setStyleSheet(
+                "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+
+    def _set_adapter_info_error(self, message: str):
+        fallback = {
+            "adapter": "N/A",
+            "description": "PowerShell adapter details unavailable",
+            "status": "N/A",
+            "connection_type": "N/A",
+            "link_speed": "N/A",
+            "duplex": "N/A",
+            "ipv4": get_local_ip(),
+            "gateway": get_default_gateway(),
+            "dns_servers": "N/A",
+            "mac": get_primary_mac(),
+            "interface_index": "N/A",
+            "diagnosis": (
+                f"{message}\n\n"
+                "The app could not read Windows adapter link-speed data. "
+                "You can still compare local IP/gateway here, then check Windows Settings > Network & internet > "
+                "Advanced network settings for Link speed."
+            ),
+        }
+        self._set_adapter_info(fallback)
+        if self.adapter_status_label is not None:
+            self.adapter_status_label.setText("Adapter link-speed details unavailable.")
+            self.adapter_status_label.setStyleSheet(
+                "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+
+    def _finish_adapter_info(self):
+        if self.adapter_refresh_btn is not None:
+            self.adapter_refresh_btn.setEnabled(True)
+
+    def show_lan_throughput_window(self):
+        """Open the iperf3 LAN throughput diagnostic window."""
+        if self.lan_window is None:
+            self.lan_window = QWidget(None, Qt.Window)
+            self.lan_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.lan_window.setWindowTitle("LAN Throughput")
+            self.lan_window.setMinimumSize(820, 650)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            client_group = QGroupBox("Client Test")
+            client_grid = QGridLayout()
+            client_grid.setHorizontalSpacing(8)
+            client_grid.setVerticalSpacing(8)
+            self.lan_host_input = QLineEdit(self.gateway_label.text().strip() or self.host_input.text().strip())
+            self.lan_host_input.setPlaceholderText("IP or hostname of iperf3 server")
+            self.lan_host_input.setMinimumWidth(320)
+            self.lan_port_spin = QSpinBox()
+            self.lan_port_spin.setRange(1, 65535)
+            self.lan_port_spin.setValue(5201)
+            self.lan_duration_spin = QSpinBox()
+            self.lan_duration_spin.setRange(1, 120)
+            self.lan_duration_spin.setValue(10)
+            self.lan_duration_spin.setSuffix(" sec")
+            self.lan_direction_combo = QComboBox()
+            self.lan_direction_combo.addItems(["Upload to server", "Download from server"])
+            self.lan_run_btn = QPushButton("Run LAN Test")
+            self.lan_run_btn.clicked.connect(self.start_lan_throughput_test)
+
+            client_grid.addWidget(QLabel("Server"), 0, 0)
+            client_grid.addWidget(self.lan_host_input, 0, 1, 1, 5)
+            client_grid.addWidget(QLabel("Port"), 1, 0)
+            client_grid.addWidget(self.lan_port_spin, 1, 1)
+            client_grid.addWidget(QLabel("Duration"), 1, 2)
+            client_grid.addWidget(self.lan_duration_spin, 1, 3)
+            client_grid.addWidget(QLabel("Direction"), 1, 4)
+            client_grid.addWidget(self.lan_direction_combo, 1, 5)
+            client_grid.addWidget(self.lan_run_btn, 1, 6)
+            client_grid.setColumnStretch(1, 1)
+            client_group.setLayout(client_grid)
+            layout.addWidget(client_group)
+
+            server_group = QGroupBox("Local Server")
+            server_grid = QGridLayout()
+            server_grid.setHorizontalSpacing(8)
+            server_grid.setVerticalSpacing(8)
+            self.lan_server_port_spin = QSpinBox()
+            self.lan_server_port_spin.setRange(1, 65535)
+            self.lan_server_port_spin.setValue(5201)
+            self.lan_server_start_btn = QPushButton("Start Server")
+            self.lan_server_start_btn.clicked.connect(self.start_lan_server)
+            self.lan_server_stop_btn = QPushButton("Stop Server")
+            self.lan_server_stop_btn.setEnabled(False)
+            self.lan_server_stop_btn.clicked.connect(self.stop_lan_server)
+            server_grid.addWidget(QLabel("Port"), 0, 0)
+            server_grid.addWidget(self.lan_server_port_spin, 0, 1)
+            server_grid.addWidget(self.lan_server_start_btn, 0, 2)
+            server_grid.addWidget(self.lan_server_stop_btn, 0, 3)
+            server_grid.addWidget(QLabel(f"This PC IP: {self.host_ip_label.text().strip() or get_local_ip()}"), 0, 4)
+            server_grid.setColumnStretch(4, 1)
+            server_group.setLayout(server_grid)
+            layout.addWidget(server_group)
+
+            self.lan_status_label = QLabel("Ready")
+            self.lan_status_label.setAlignment(Qt.AlignCenter)
+            self.lan_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.lan_status_label)
+
+            results_group = QGroupBox("Results")
+            results_grid = QGridLayout()
+            results_grid.setHorizontalSpacing(12)
+            results_grid.setVerticalSpacing(8)
+            result_fields = [
+                ("throughput", "Throughput"),
+                ("direction", "Direction"),
+                ("server", "Server"),
+                ("duration", "Duration"),
+                ("transferred", "Transferred"),
+                ("retransmits", "Retransmits"),
+            ]
+            self.lan_result_labels = {}
+            for row, (key, label_text) in enumerate(result_fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.lan_result_labels[key] = value
+                results_grid.addWidget(name, row // 2, (row % 2) * 2)
+                results_grid.addWidget(value, row // 2, (row % 2) * 2 + 1)
+            results_grid.setColumnStretch(1, 1)
+            results_grid.setColumnStretch(3, 1)
+            results_group.setLayout(results_grid)
+            layout.addWidget(results_group)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.lan_diagnosis_box = QTextEdit()
+            self.lan_diagnosis_box.setReadOnly(True)
+            self.lan_diagnosis_box.setMinimumHeight(90)
+            self.lan_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.lan_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group)
+
+            raw_group = QGroupBox("Raw iperf3 JSON")
+            raw_layout = QVBoxLayout()
+            self.lan_raw_box = QTextEdit()
+            self.lan_raw_box.setReadOnly(True)
+            self.lan_raw_box.setMinimumHeight(130)
+            self.lan_raw_box.setLineWrapMode(QTextEdit.NoWrap)
+            raw_layout.addWidget(self.lan_raw_box)
+            raw_group.setLayout(raw_layout)
+            layout.addWidget(raw_group, 1)
+
+            self.lan_window.setLayout(layout)
+
+        if self.lan_host_input is not None and not self.lan_host_input.text().strip():
+            self.lan_host_input.setText(self.gateway_label.text().strip() or self.host_input.text().strip())
+        self.lan_window.show()
+        self.lan_window.raise_()
+        self.lan_window.activateWindow()
+
+    def _find_iperf3_executable(self):
+        exe_name = "iperf3.exe" if platform.system() == "Windows" else "iperf3"
+        for root in self._speedtest_candidate_roots():
+            for rel in (
+                os.path.join("tools", "iperf3", exe_name),
+                os.path.join("bin", exe_name),
+                exe_name,
+            ):
+                candidate = os.path.join(root, rel)
+                if os.path.isfile(candidate):
+                    return candidate
+        return shutil.which("iperf3")
+
+    def _set_lan_status(self, message: str, level="info"):
+        if self.lan_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.lan_status_label.setText(message)
+        self.lan_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }}"
+        )
+
+    def start_lan_throughput_test(self):
+        if self.lan_throughput_worker is not None and self.lan_throughput_worker.isRunning():
+            return
+        executable = self._find_iperf3_executable()
+        if not executable:
+            self._set_lan_status(
+                "iperf3 not found. Put iperf3.exe in tools/iperf3 or install iperf3 so it is available on PATH.",
+                "error",
+            )
+            return
+        host = self.lan_host_input.text().strip() if self.lan_host_input is not None else ""
+        if not host:
+            QMessageBox.warning(self, "LAN Throughput Error", "Enter an iperf3 server host.")
+            return
+
+        if self.lan_run_btn is not None:
+            self.lan_run_btn.setEnabled(False)
+        for label in self.lan_result_labels.values():
+            label.setText("N/A")
+        if self.lan_diagnosis_box is not None:
+            self.lan_diagnosis_box.clear()
+        if self.lan_raw_box is not None:
+            self.lan_raw_box.clear()
+        self._set_lan_status("Running LAN throughput test...", "running")
+
+        self.lan_throughput_worker = LanThroughputWorker(
+            executable,
+            host,
+            port=self.lan_port_spin.value(),
+            duration=self.lan_duration_spin.value(),
+            reverse=self.lan_direction_combo.currentText().startswith("Download"),
+        )
+        self.lan_throughput_worker.result_ready.connect(self._set_lan_result)
+        self.lan_throughput_worker.error_ready.connect(self._set_lan_error)
+        self.lan_throughput_worker.finished.connect(self._finish_lan_test)
+        self.lan_throughput_worker.finished.connect(self.lan_throughput_worker.deleteLater)
+        self.lan_throughput_worker.finished.connect(lambda: setattr(self, "lan_throughput_worker", None))
+        self.lan_throughput_worker.start()
+
+    def _set_lan_result(self, result: dict):
+        self.lan_last_result = result
+        values = {
+            "throughput": result.get("throughput", "N/A"),
+            "direction": result.get("direction", "N/A"),
+            "server": f"{result.get('host', 'N/A')}:{result.get('port', 'N/A')}",
+            "duration": result.get("seconds", "N/A"),
+            "transferred": result.get("transferred", "N/A"),
+            "retransmits": result.get("retransmits", "N/A"),
+        }
+        for key, value in values.items():
+            if key in self.lan_result_labels:
+                self.lan_result_labels[key].setText(str(value))
+        if self.lan_diagnosis_box is not None:
+            self.lan_diagnosis_box.setPlainText(result.get("diagnosis", "N/A"))
+        if self.lan_raw_box is not None:
+            self.lan_raw_box.setPlainText(result.get("raw", ""))
+        self._set_lan_status("LAN throughput test completed.", "ok")
+
+    def _set_lan_error(self, message: str):
+        self._set_lan_status(f"LAN throughput failed: {message}", "error")
+        if self.lan_diagnosis_box is not None:
+            self.lan_diagnosis_box.setPlainText(
+                "Check that iperf3 is installed on both machines, the remote server is running, "
+                "Windows Firewall allows the selected port, and both devices are on the expected LAN path."
+            )
+
+    def _finish_lan_test(self):
+        if self.lan_run_btn is not None:
+            self.lan_run_btn.setEnabled(True)
+
+    def start_lan_server(self):
+        if self.lan_server_process is not None and self.lan_server_process.poll() is None:
+            self._set_lan_status("iperf3 server is already running.", "info")
+            return
+        executable = self._find_iperf3_executable()
+        if not executable:
+            self._set_lan_status(
+                "iperf3 not found. Put iperf3.exe in tools/iperf3 or install iperf3 so it is available on PATH.",
+                "error",
+            )
+            return
+        port = self.lan_server_port_spin.value() if self.lan_server_port_spin is not None else 5201
+        cmd = [executable, "-s", "-p", str(port)]
+        try:
+            kwargs = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            self.lan_server_process = subprocess.Popen(cmd, **kwargs)
+        except OSError as e:
+            self._set_lan_status(f"Could not start iperf3 server: {e}", "error")
+            return
+
+        if self.lan_server_start_btn is not None:
+            self.lan_server_start_btn.setEnabled(False)
+        if self.lan_server_stop_btn is not None:
+            self.lan_server_stop_btn.setEnabled(True)
+        self._set_lan_status(f"iperf3 server running on port {port}. Use this PC IP from another machine.", "ok")
+
+    def stop_lan_server(self):
+        proc = self.lan_server_process
+        self.lan_server_process = None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        if self.lan_server_start_btn is not None:
+            self.lan_server_start_btn.setEnabled(True)
+        if self.lan_server_stop_btn is not None:
+            self.lan_server_stop_btn.setEnabled(False)
+        self._set_lan_status("iperf3 server stopped.", "info")
+
     def show_http_test_window(self):
         """Open the HTTP/HTTPS diagnostic window."""
         if self.http_window is None:
@@ -3056,6 +3813,507 @@ class PingerApp(QWidget):
         self.alert_window.show()
         self.alert_window.raise_()
         self.alert_window.activateWindow()
+
+    def show_help_window(self):
+        """Open the offline help and documentation window."""
+        if self.help_window is None:
+            self.help_window = QWidget(None, Qt.Window)
+            self.help_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.help_window.setWindowTitle("Help")
+            self.help_window.setMinimumSize(860, 700)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            self.help_text_box = QTextEdit()
+            self.help_text_box.setReadOnly(True)
+            self.help_text_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            self.help_text_box.setHtml(self._help_documentation_html())
+            layout.addWidget(self.help_text_box, 1)
+            self.help_window.setLayout(layout)
+
+        self.help_window.show()
+        self.help_window.raise_()
+        self.help_window.activateWindow()
+
+    def _help_documentation_html(self):
+        return """
+        <html>
+        <head>
+        <style>
+            body { font-family: Segoe UI, Arial, sans-serif; font-size: 10pt; color: #202124; }
+            h1 { font-size: 18pt; margin-bottom: 8px; }
+            h2 { font-size: 13pt; margin-top: 18px; margin-bottom: 6px; color: #174ea6; }
+            h3 { font-size: 11pt; margin-top: 12px; margin-bottom: 4px; }
+            p { margin: 5px 0; }
+            ul { margin-top: 4px; margin-bottom: 8px; }
+            li { margin-bottom: 4px; }
+            code { background: #f1f3f4; padding: 1px 4px; }
+            .note { background: #eef2f7; border: 1px solid #b7c0cc; padding: 8px; margin: 8px 0; }
+            .warn { background: #fff4ce; border: 1px solid #d8b756; padding: 8px; margin: 8px 0; }
+        </style>
+        </head>
+        <body>
+        <h1>PingerApp Help</h1>
+        <p>PingerApp is a local network troubleshooting tool. It is designed for checking your own connection, devices, services, and ISP path.</p>
+
+        <h2>Main Window</h2>
+        <h3>Ping Panel</h3>
+        <ul>
+            <li><b>Host</b>: hostname or IP address used by the ping monitor and as the default target for tools.</li>
+            <li><b>Reverse DNS</b>: hostname found for the current target IP when available.</li>
+            <li><b>Start/Stop</b>: starts or stops the continuous ping session.</li>
+            <li><b>Pause/Resume</b>: pauses the session timer and ping loop without clearing current stats.</li>
+            <li><b>Live Latency</b>: most recent ping round-trip time. <code>Timeout</code> means the target did not reply before the ping timeout.</li>
+            <li><b>Live Jitter</b>: difference between the latest successful ping and the previous successful ping.</li>
+            <li><b>RTT Health</b>: rolling health view based on average latency and packet loss.</li>
+            <li><b>Jitter Health</b>: rolling health view based on average jitter.</li>
+            <li><b>Elapsed Time</b>: current ping session duration.</li>
+        </ul>
+
+        <h3>Alert Thresholds</h3>
+        <ul>
+            <li><b>Latency Alert</b>: logs an alert when a successful ping is higher than the selected millisecond value.</li>
+            <li><b>Loss Alert</b>: logs an alert when session packet loss is higher than the selected percentage.</li>
+            <li><b>Jitter Alert</b>: logs an alert when ping-to-ping variation is higher than the selected millisecond value.</li>
+            <li><b>History</b>: number of recent ping samples kept in the graphs and report. Range is 10 to 100.</li>
+            <li><b>Default</b>: resets the matching threshold or history value to the app default.</li>
+            <li><b>Alert toggle buttons</b>: switch each alert type on or off without changing the threshold value.</li>
+        </ul>
+
+        <h3>Monitoring Boxes</h3>
+        <ul>
+            <li><b>Alert Counts</b>: count of latency and loss threshold breaches. Reset Stats clears counts, samples, graphs, and alert log.</li>
+            <li><b>Latency Stats</b>: best 10 average, worst 10 average, and combined average for retained successful samples.</li>
+            <li><b>Jitter Stats</b>: minimum, maximum, and average jitter from retained successful jitter samples.</li>
+            <li><b>Host Info</b>: local hostname, local IP, gateway, public IP, ISP, and primary MAC address.</li>
+        </ul>
+
+        <h3>Graphs</h3>
+        <ul>
+            <li><b>Latency graph</b>: plots retained ping latency samples. Gaps indicate timeouts.</li>
+            <li><b>Jitter graph</b>: plots retained jitter samples. Higher jitter usually means less stable timing.</li>
+            <li><b>Auto-scale</b>: adjusts the graph range to current data and selected thresholds.</li>
+            <li><b>Graph toolbar</b>: use pan, zoom, home, and save image controls from Matplotlib.</li>
+        </ul>
+
+        <h2>Reading Common Values</h2>
+        <ul>
+            <li><b>Low latency</b>: better for calls, games, remote desktop, and interactive work.</li>
+            <li><b>High jitter</b>: timing is inconsistent even if average latency looks acceptable.</li>
+            <li><b>Packet loss</b>: any repeated loss can cause freezes, retries, or dropped real-time traffic.</li>
+            <li><b>Timeout</b>: can mean the host is down, blocks ping, is unreachable, or the network path dropped the packet.</li>
+            <li><b>MAC address</b>: normally visible only for local network devices or the next-hop device in your ARP cache.</li>
+        </ul>
+
+        <h2>Tools</h2>
+        <h3>Adapter Info</h3>
+        <ul>
+            <li>Shows the active Windows adapter, status, connection type, link speed, duplex setting, IPv4, gateway, DNS servers, MAC address, and interface index.</li>
+            <li><b>Link Speed</b> is the negotiated local connection rate between this PC and the connected router, switch, access point, dock, or adapter.</li>
+            <li>If Link Speed is <code>100 Mbps</code>, speed tests cannot reach gigabit speeds from this PC. Check cable, wall socket, switch/router port, USB dock, adapter settings, and auto-negotiation.</li>
+            <li>If Link Speed is <code>1 Gbps</code> or faster but internet speed is near 100 Mbps, check router WAN/LAN port speed, ISP profile, speed test server, or congestion.</li>
+            <li>For Wi-Fi, link rate is not the same as real throughput. Signal, band, channel width, interference, and access point capability matter.</li>
+        </ul>
+
+        <h3>LAN Throughput</h3>
+        <ul>
+            <li>Uses iperf3 to measure local network throughput between two devices on your LAN.</li>
+            <li>PingerApp includes iperf3 at <code>tools/iperf3/iperf3.exe</code> and can also use iperf3 from PATH.</li>
+            <li>On one machine, open LAN Throughput and click <b>Start Server</b>. On the other machine, enter the server machine IP and click <b>Run LAN Test</b>.</li>
+            <li><b>Upload to server</b> sends traffic from this PC to the server. <b>Download from server</b> uses iperf3 reverse mode.</li>
+            <li>A wired gigabit LAN usually lands near 900 Mbps or higher. A result around 100 Mbps points to cable, port, dock, adapter, or negotiation limits.</li>
+            <li>If LAN throughput is gigabit-class but internet Speed Test is low, focus on router WAN, ISP profile, speed test server, or congestion.</li>
+        </ul>
+
+        <h3>Speed Test</h3>
+        <ul>
+            <li>Uses LibreSpeed CLI to measure download, upload, latency, and jitter.</li>
+            <li><b>Server</b>: auto-selects by default, or choose a refreshed public server list.</li>
+            <li><b>Duration</b>: longer tests can be more stable but use more bandwidth.</li>
+            <li><b>Try share URL</b>: asks supported LibreSpeed servers for a shareable result URL.</li>
+            <li><b>History</b>: stores the last 10 speed test runs locally.</li>
+        </ul>
+
+        <h3>Network Scanner</h3>
+        <ul>
+            <li>Performs TCP connect checks against one host or a selected IPv4 subnet.</li>
+            <li><b>Target</b>: choose Single host for one target, or Subnet for a CIDR range around the entered IP.</li>
+            <li><b>Ports</b>: choose a preset or type ports such as <code>80,443,8000-8010</code>.</li>
+            <li><b>Parallel probes</b>: higher is faster, lower is gentler on small or fragile networks.</li>
+            <li><b>Probe service banners</b>: tries light banner, HTTP, and TLS probes on open ports.</li>
+            <li><b>Open</b>: TCP connection succeeded. <b>Closed</b>: host actively refused. <b>Filtered</b>: no response or dropped.</li>
+        </ul>
+
+        <h3>HTTP Test</h3>
+        <ul>
+            <li>Runs GET or HEAD against an HTTP/HTTPS URL.</li>
+            <li><b>Follow redirects</b>: shows the final URL after redirects when enabled.</li>
+            <li><b>Ignore TLS certificate errors</b>: useful for local HTTPS services with self-signed certificates.</li>
+            <li>Review status code, response time, redirect count, TLS summary, headers, and error details.</li>
+        </ul>
+
+        <h3>DNS / WHOIS</h3>
+        <ul>
+            <li>Runs forward or reverse DNS lookups.</li>
+            <li><b>Record</b>: choose A, AAAA, MX, NS, TXT, CNAME, SOA, or ANY.</li>
+            <li><b>Include IP / ASN / ISP</b>: adds ownership metadata for resolved IP addresses when available.</li>
+        </ul>
+
+        <h3>DNS Compare</h3>
+        <ul>
+            <li>Compares answers and response times across System DNS, Cloudflare, Google, and Quad9.</li>
+            <li>Useful when one resolver gives stale, missing, or different answers.</li>
+            <li>Errors in one resolver do not necessarily mean the target hostname is broken everywhere.</li>
+        </ul>
+
+        <h3>MTU Test</h3>
+        <ul>
+            <li>Finds the largest ping payload that can pass without fragmentation.</li>
+            <li><b>Estimated MTU</b> is the successful payload plus IP/ICMP header overhead.</li>
+            <li>Repeated failures can mean ICMP is blocked, the target is unreachable, or the path blocks non-fragmenting probes.</li>
+        </ul>
+
+        <h3>Traceroute</h3>
+        <ul>
+            <li>Shows the network hops between this PC and the target.</li>
+            <li><b>*</b> or missing latency can mean a hop ignores traceroute probes while still forwarding traffic.</li>
+            <li>Problems near the first hops usually point to local/router/ISP access issues. Problems only near the end may be remote-side routing.</li>
+        </ul>
+
+        <h3>Alerts</h3>
+        <ul>
+            <li>Shows timestamped latency, packet loss, and jitter threshold breaches.</li>
+            <li>The Alerts button gets an asterisk when new alerts arrive while the alert window is closed.</li>
+        </ul>
+
+        <h3>Report</h3>
+        <ul>
+            <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
+            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
+            <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
+            <li><b>Save as TXT</b> writes the current report to a text file.</li>
+        </ul>
+
+        <div class="warn">
+            Run diagnostic scans only on networks, hosts, and services you own or are authorized to troubleshoot.
+        </div>
+        </body>
+        </html>
+        """
+
+    def show_report_window(self):
+        """Open the troubleshooting report builder."""
+        if self.report_window is None:
+            self.report_window = QWidget(None, Qt.Window)
+            self.report_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.report_window.setWindowTitle("Report")
+            self.report_window.setMinimumSize(820, 640)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            sections_group = QGroupBox("Sections")
+            sections_grid = QGridLayout()
+            sections_grid.setContentsMargins(10,10,10,10)
+            sections_grid.setHorizontalSpacing(16)
+            sections_grid.setVerticalSpacing(8)
+            section_defs = [
+                ("host_info", "Host Info"),
+                ("adapter_info", "Adapter info"),
+                ("ping_stats", "Ping stats"),
+                ("lan_throughput", "LAN Throughput"),
+                ("speedtest_history", "Speed Test history"),
+                ("dns_lookup", "Last DNS lookup"),
+                ("traceroute", "Last traceroute"),
+                ("network_scanner", "Network Scanner results"),
+            ]
+            self.report_checkboxes = {}
+            for index, (key, label) in enumerate(section_defs):
+                checkbox = QCheckBox(label)
+                checkbox.setChecked(True)
+                checkbox.toggled.connect(self.update_report_preview)
+                self.report_checkboxes[key] = checkbox
+                sections_grid.addWidget(checkbox, index // 2, index % 2)
+            sections_grid.setColumnStretch(0, 1)
+            sections_grid.setColumnStretch(1, 1)
+            sections_group.setLayout(sections_grid)
+            layout.addWidget(sections_group)
+
+            action_row = QHBoxLayout()
+            refresh_btn = QPushButton("Refresh Preview")
+            refresh_btn.clicked.connect(self.update_report_preview)
+            save_btn = QPushButton("Save as TXT")
+            save_btn.clicked.connect(self.save_report)
+            action_row.addWidget(refresh_btn)
+            action_row.addWidget(save_btn)
+            action_row.addStretch(1)
+            layout.addLayout(action_row)
+
+            self.report_preview_box = QTextEdit()
+            self.report_preview_box.setReadOnly(True)
+            self.report_preview_box.setLineWrapMode(QTextEdit.NoWrap)
+            self.report_preview_box.setPlaceholderText("Report preview will appear here.")
+            layout.addWidget(self.report_preview_box, 1)
+
+            self.report_window.setLayout(layout)
+
+        self.update_report_preview()
+        self.report_window.show()
+        self.report_window.raise_()
+        self.report_window.activateWindow()
+
+    def update_report_preview(self):
+        if self.report_preview_box is not None:
+            self.report_preview_box.setPlainText(self.build_report_text())
+
+    def save_report(self):
+        report_text = self.build_report_text()
+        if self.report_preview_box is not None:
+            self.report_preview_box.setPlainText(report_text)
+
+        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+        default_name = f"PingerApp_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        default_path = os.path.join(root, "data", default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self.report_window or self,
+            "Save Report",
+            default_path,
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".txt"
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(report_text)
+        except OSError as e:
+            QMessageBox.critical(self.report_window or self, "Report Error", f"Could not save report:\n{e}")
+            return
+        QMessageBox.information(self.report_window or self, "Report Saved", f"Saved report to:\n{path}")
+
+    def _report_section_enabled(self, key: str):
+        checkbox = self.report_checkboxes.get(key)
+        return checkbox is None or checkbox.isChecked()
+
+    def build_report_text(self):
+        lines = [
+            "PingerApp Troubleshooting Report",
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Target: {self.host_input.text().strip() or 'N/A'}",
+            "",
+        ]
+
+        sections = [
+            ("host_info", "Host Info", self._report_host_info_lines),
+            ("adapter_info", "Adapter Info", self._report_adapter_info_lines),
+            ("ping_stats", "Ping Stats", self._report_ping_stats_lines),
+            ("lan_throughput", "LAN Throughput", self._report_lan_throughput_lines),
+            ("speedtest_history", "Speed Test History", self._report_speedtest_history_lines),
+            ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
+            ("traceroute", "Last Traceroute", self._report_traceroute_lines),
+            ("network_scanner", "Network Scanner Results", self._report_network_scanner_lines),
+        ]
+        for key, title, builder in sections:
+            if not self._report_section_enabled(key):
+                continue
+            self._append_report_section(lines, title, builder())
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _append_report_section(self, lines, title, body_lines):
+        lines.extend([title, "-" * len(title)])
+        lines.extend(body_lines or ["No data available."])
+        lines.append("")
+
+    def _label_text(self, label):
+        if label is None:
+            return "N/A"
+        value = label.text().strip()
+        return value if value else "N/A"
+
+    def _report_host_info_lines(self):
+        return [
+            f"Hostname: {self._label_text(self.hostname_label)}",
+            f"Local IP: {self._label_text(self.host_ip_label)}",
+            f"Gateway: {self._label_text(self.gateway_label)}",
+            f"Public IP: {self._label_text(self.public_ip_label)}",
+            f"ISP: {self._label_text(self.public_isp_label)}",
+            f"MAC: {self._label_text(self.host_mac_label)}",
+        ]
+
+    def _report_adapter_info_lines(self):
+        if not self.adapter_labels:
+            return ["Adapter Info has not been opened or refreshed yet."]
+        rows = [
+            ("Adapter", "adapter"),
+            ("Description", "description"),
+            ("Status", "status"),
+            ("Type", "connection_type"),
+            ("Link Speed", "link_speed"),
+            ("Duplex / Setting", "duplex"),
+            ("IPv4", "ipv4"),
+            ("Gateway", "gateway"),
+            ("DNS Servers", "dns_servers"),
+            ("MAC", "mac"),
+            ("Interface Index", "interface_index"),
+        ]
+        lines = [f"{label}: {self._label_text(self.adapter_labels.get(key))}" for label, key in rows]
+        if self.adapter_diagnosis_box is not None:
+            diagnosis = self.adapter_diagnosis_box.toPlainText().strip()
+            if diagnosis:
+                lines.extend(["", "Diagnosis:", diagnosis])
+        return lines
+
+    def _report_ping_stats_lines(self):
+        retained_latencies = list(self.latencies)
+        retained_jitters = list(self.jitters)
+        valid_latencies = self._valid_values(retained_latencies)
+        valid_jitters = self._valid_values(retained_jitters)
+        timeout_count = retained_latencies.count(None)
+        rolling_loss = 0.0 if not retained_latencies else (timeout_count / len(retained_latencies)) * 100
+
+        def sample_text(values):
+            if not values:
+                return "N/A"
+            formatted = ["Timeout" if value is None else f"{value:.1f}" for value in values]
+            return ", ".join(formatted)
+
+        return [
+            f"Ping target: {self.host_input.text().strip() or 'N/A'}",
+            f"Reverse DNS: {self.reverse_dns_disp.text().strip() or 'N/A'}",
+            f"Session elapsed: {self.elapsed_display.text().strip() or '00:00'}",
+            f"Total pings: {self.ping_count}",
+            f"Total timeouts: {self.timeouts}",
+            f"Current packet loss: {self.loss_value_label.text().strip() or '0.0%'}",
+            f"Rolling retained samples: {len(retained_latencies)}",
+            f"Rolling retained loss: {rolling_loss:.1f}%",
+            f"Live latency: {self.live_latency.text().strip() or 'N/A'}",
+            f"Live jitter: {self.live_jitter.text().strip() or 'N/A'}",
+            f"RTT health: {self.rtt_health_label.text().strip() or 'N/A'}",
+            f"Jitter health: {self.jitter_health_label.text().strip() or 'N/A'}",
+            f"Latency threshold: {self.lat_thresh_input.text().strip() or 'N/A'} ms",
+            f"Loss threshold: {self.loss_thresh_input.text().strip() or 'N/A'}%",
+            f"Jitter threshold: {self.jit_thresh_input.text().strip() or 'N/A'} ms",
+            f"Latency breaches: {self.lat_count_label.text().strip() or '0'}",
+            f"Loss breaches: {self.loss_count_label.text().strip() or '0'}",
+            f"Avg best 10: {self.avg_low_label.text().strip() or 'N/A'}",
+            f"Avg worst 10: {self.avg_high_label.text().strip() or 'N/A'}",
+            f"Avg combined: {self.avg_comb_label.text().strip() or 'N/A'}",
+            f"Min jitter: {self.jit_low_label.text().strip() or 'N/A'}",
+            f"Max jitter: {self.jit_high_label.text().strip() or 'N/A'}",
+            f"Avg jitter: {self.jit_avg_label.text().strip() or 'N/A'}",
+            f"Retained latency samples (ms): {sample_text(retained_latencies)}",
+            f"Retained jitter samples (ms): {sample_text(retained_jitters)}",
+            f"Successful retained latency samples: {len(valid_latencies)}",
+            f"Successful retained jitter samples: {len(valid_jitters)}",
+        ]
+
+    def _report_lan_throughput_lines(self):
+        if not self.lan_last_result:
+            return ["No LAN Throughput result available."]
+        result = self.lan_last_result
+        return [
+            f"Server: {result.get('host', 'N/A')}:{result.get('port', 'N/A')}",
+            f"Direction: {result.get('direction', 'N/A')}",
+            f"Throughput: {result.get('throughput', 'N/A')}",
+            f"Duration: {result.get('seconds', 'N/A')}",
+            f"Transferred: {result.get('transferred', 'N/A')}",
+            f"Retransmits: {result.get('retransmits', 'N/A')}",
+            "",
+            "Diagnosis:",
+            result.get("diagnosis", "N/A"),
+        ]
+
+    def _report_speedtest_history_lines(self):
+        rows = self._speedtest_history_rows()
+        if not rows:
+            path = self._speedtest_history_path()
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                loaded = []
+            rows = [row for row in loaded if isinstance(row, list)]
+
+        if not rows:
+            return ["No Speed Test history available."]
+
+        headers = ["Time", "Down", "Up", "Latency", "Jitter", "Server", "Data"]
+        lines = [" | ".join(headers)]
+        for row in rows[:10]:
+            padded = [str(value) for value in row[:len(headers)]]
+            padded.extend([""] * (len(headers) - len(padded)))
+            lines.append(" | ".join(padded))
+        return lines
+
+    def _report_dns_lookup_lines(self):
+        result = self.dns_result_box.toPlainText().strip()
+        if not result or result == "Running lookup...":
+            return ["No DNS lookup result available."]
+        query = self.dns_input.text().strip() or "N/A"
+        record = self.dns_record_combo.currentText() if self.dns_record_combo is not None else "A"
+        return [f"Query: {query}", f"Record: {record}", "", result]
+
+    def _report_traceroute_lines(self):
+        rows = self._table_rows(self.tr_table)
+        raw = self.trace_raw_box.toPlainText().strip() if self.trace_raw_box is not None else ""
+        if not rows and not raw:
+            return ["No traceroute result available."]
+
+        target = self.trace_input.text().strip() if self.trace_input is not None else self.host_input.text().strip()
+        lines = [f"Target: {target or 'N/A'}"]
+        if rows:
+            lines.append("Hop | IP | Host | Latency")
+            lines.extend(" | ".join(row) for row in rows)
+        if raw:
+            lines.extend(["", "Raw output:", raw])
+        return lines
+
+    def _report_network_scanner_lines(self):
+        if not self.port_scan_results:
+            return ["No Network Scanner results available."]
+
+        lines = [
+            f"Hosts found: {self.port_scan_host_count}",
+            f"Port rows: {self.port_scan_result_count}",
+            f"Open ports: {self.port_scan_open_count}",
+            f"Filtered/dropped: {self.port_scan_filtered_count}",
+            "",
+            "Host | Hostname | MAC | Port | Service | State | Latency | Details",
+        ]
+        for result in self.port_scan_results:
+            latency = "N/A" if result.get("latency") is None else f"{result.get('latency'):.1f} ms"
+            lines.append(
+                " | ".join([
+                    str(result.get("host", "")),
+                    str(result.get("hostname", "N/A")),
+                    str(result.get("mac", "N/A")),
+                    "" if result.get("port") in (None, "") else str(result.get("port")),
+                    str(result.get("service", "")),
+                    str(result.get("status", "")),
+                    latency,
+                    clean_probe_text(str(result.get("error", "")), max_len=260),
+                ])
+            )
+        return lines
+
+    def _table_rows(self, table):
+        rows = []
+        if table is None:
+            return rows
+        for row in range(table.rowCount()):
+            values = []
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                values.append(item.text() if item is not None else "")
+            rows.append(values)
+        return rows
 
     def show_speedtest_window(self):
         """Open the non-modal speed test window."""
@@ -4188,6 +5446,7 @@ class PingerApp(QWidget):
     def closeEvent(self, event):
         self.timer.stop()
         self.elapsed_timer.stop()
+        self.stop_lan_server()
         self._close_ping_socket()
         super().closeEvent(event)
 

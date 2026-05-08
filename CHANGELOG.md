@@ -35,6 +35,13 @@
 - Added an HTTP Test option to ignore TLS certificate errors for local HTTPS services using self-signed certificates.
 - Added a DNS Compare tool window using `nslookup` to compare System DNS, Cloudflare, Google, and Quad9 answers and response times.
 - Added an MTU Test tool window that probes non-fragmenting ping payload sizes and reports estimated path MTU with raw output details.
+- Added a Report tool with selectable sections, live preview, and `.txt` export for Host Info, Adapter Info, ping stats, Speed Test history, DNS lookup, traceroute, and Network Scanner results.
+- Added an offline Help window explaining the main controls, sliders, monitoring boxes, graphs, diagnostic tools, report builder, and common result meanings.
+- Added an Adapter Info tool to show active adapter status, link speed, connection type, IPv4, gateway, DNS servers, MAC address, duplex setting where available, and 100 Mbps vs gigabit diagnosis.
+- Added Adapter Info to the Report tool and Help documentation.
+- Added a LAN Throughput tool using optional iperf3 client/server mode to separate local LAN bottlenecks from internet/ISP speed problems.
+- Added LAN Throughput to the Report tool, Help documentation, README, and packaging notes.
+- Bundled iperf3 3.21 for Windows x64 with Cygwin runtime DLL, checksums, source records, and license notices.
 
 ## 2026-05-07
 

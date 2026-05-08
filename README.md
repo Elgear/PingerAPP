@@ -18,6 +18,8 @@ Host Info includes local hostname, local IP, first-hop gateway, public IP, publi
 The right-side Tools panel opens separate diagnostic windows:
 
 - Speed Test: LibreSpeed-based internet speed test with persistent history.
+- Adapter Info: active adapter link speed, status, type, IP, gateway, DNS, MAC, duplex setting where available, and diagnosis for 100 Mbps vs gigabit negotiation.
+- LAN Throughput: bundled iperf3 client/server tool for testing local network throughput separately from internet speed.
 - Network Scanner: safe TCP connect scanning for one host or an IPv4 subnet, with grouped Target/Scan/Display controls, section header help beside each section label, common CIDR size selection, named port presets with exact-port preview, stop control, grouped-by-host wrapped results, separate Host State, Open Ports, and Port State columns, result filtering, highlighted open/live rows, host discovery, full-port/specific-port presets, open/closed/filtered state reporting, service names, optional light service probes, progress, latency, and hostname/MAC lookup through reverse DNS, ARP, and Windows NetBIOS where available.
 - HTTP Test: HTTP/HTTPS request diagnostics with GET/HEAD, redirect control, optional self-signed certificate allowance for local HTTPS tests, timing, final URL, TLS certificate summary, headers, and error details.
 - DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.
@@ -25,6 +27,8 @@ The right-side Tools panel opens separate diagnostic windows:
 - MTU Test: find the largest non-fragmenting ping payload and estimated path MTU, with raw ping output details.
 - Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
 - Alerts: threshold alert log.
+- Report: selectable troubleshooting report with preview and `.txt` export for Host Info, Adapter Info, ping stats, LAN Throughput, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results.
+- Help: offline field guide explaining the main panels, controls, graph readings, tool workflows, report output, and common diagnostic meanings.
 
 MAC addresses can only be discovered when the target exposes them on the local network path. Routed hosts usually show no MAC address, or only the next-hop device in the local ARP cache.
 
@@ -40,6 +44,18 @@ The app also falls back to `librespeed-cli` on `PATH` if the bundled executable 
 
 The bundled binary is LibreSpeed CLI v1.0.13 for Windows x64. Its source release, checksum, and license are recorded in `tools/librespeed/VERSION.txt` and `tools/librespeed/LICENSE.librespeed-cli.txt`. LibreSpeed CLI is licensed under LGPL-3.0, so keep it replaceable as a separate executable in packaged builds.
 
+## LAN Throughput
+
+The LAN Throughput window uses the bundled iperf3 executable at:
+
+```text
+tools/iperf3/iperf3.exe
+```
+
+The app also falls back to `iperf3` on `PATH` if the bundled executable is not present. Run the iperf3 server on one local machine and the client test from another machine to separate LAN, cable, switch, Wi-Fi, or adapter bottlenecks from ISP/WAN speed problems.
+
+The bundled Windows build is iperf3 3.21 and includes `cygwin1.dll`. Source, license, and checksum records are in `tools/iperf3/VERSION.txt`, `tools/iperf3/CHECKSUMS.txt`, and the `tools/iperf3/LICENSE.*.txt` files.
+
 ## Packaging Notes
 
 For a PC install, package the PyQt app with PyInstaller or a similar tool, then wrap the output with an installer such as Inno Setup. The installer should include:
@@ -48,5 +64,7 @@ For a PC install, package the PyQt app with PyInstaller or a similar tool, then 
 - required Python libraries,
 - bundled `tools/librespeed/librespeed-cli.exe`,
 - LibreSpeed CLI license attribution,
+- bundled `tools/iperf3/iperf3.exe` and `tools/iperf3/cygwin1.dll`,
+- iperf3, Windows build, and Cygwin license attribution,
 - a Start Menu shortcut,
 - a note that ICMP ping may require elevated permissions depending on the machine.

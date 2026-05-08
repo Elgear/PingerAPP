@@ -1,0 +1,6 @@
+iperf3 3.21 for Windows x64
+Windows build source: https://github.com/ar51an/iperf3-win-builds/releases/tag/3.21
+Asset: iperf-3.21-win64.zip
+Upstream project: https://github.com/esnet/iperf
+Cygwin runtime: cygwin1.dll 3.6.7-1.x86_64
+Archive SHA256: 9B73B7E0E0326347B5F4AC4F6A1FC34FE60A5966E5FD172C7BFCD0E1CC93E709
