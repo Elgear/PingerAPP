@@ -39,10 +39,8 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 ## Next Features
 
 1. Packaging
-   - PyInstaller build configuration.
-   - Include bundled LibreSpeed CLI and license files.
-   - Include bundled iperf3 runtime and license files.
    - Test packaged build on a clean Windows PC.
+   - Create an installer, likely with Inno Setup.
 
 ## Completed Tool Milestones
 
@@ -61,10 +59,11 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 
 ## Packaging
 
-- Create a PyInstaller build configuration.
-- Include bundled `tools/librespeed/librespeed-cli.exe`.
-- Include LibreSpeed CLI license and attribution files.
-- Include bundled `tools/iperf3/iperf3.exe`, `tools/iperf3/cygwin1.dll`, and related license files.
+- PyInstaller spec and Windows build script are in place.
+- Local PyInstaller one-folder build has been run and smoke-tested.
+- Build includes bundled `tools/librespeed/librespeed-cli.exe`.
+- Build includes LibreSpeed CLI license and attribution files.
+- Build includes bundled `tools/iperf3/iperf3.exe`, `tools/iperf3/cygwin1.dll`, and related license files.
 - Test a packaged build on a clean Windows PC.
 - Create an installer, likely with Inno Setup.
 

@@ -63,7 +63,17 @@ The bundled Windows build is iperf3 3.21 and includes `cygwin1.dll`. Source, lic
 
 ## Packaging Notes
 
-For a PC install, package the PyQt app with PyInstaller or a similar tool, then wrap the output with an installer such as Inno Setup. The installer should include:
+For a local Windows build, use the PyInstaller wrapper script:
+
+```powershell
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+.\scripts\build_windows.ps1 -Clean
+```
+
+The build output is written to `dist\PingerApp\PingerApp.exe`. Full packaging notes are in `PACKAGING.md`.
+
+For a PC install, wrap the PyInstaller output with an installer such as Inno Setup. The installer should include:
 
 - the PingerApp executable and Python runtime bundle,
 - required Python libraries,

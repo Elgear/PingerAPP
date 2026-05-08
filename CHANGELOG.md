@@ -53,6 +53,8 @@
 - Added a Wi-Fi Diagnostics tool for SSID, signal, band, channel, protocol, link rates, security details, diagnosis, Help, and Report support.
 - Added a Speed Targets tool to compare short LibreSpeed runs across multiple servers and diagnose poor server/CDN target selection.
 - Updated Speed Targets so selected table rows are compared, with the top fallback count used only when no rows are selected.
+- Added a PyInstaller spec, Windows build script, packaging notes, and development dependency file for packaged builds.
+- Verified the local PyInstaller one-folder build starts and includes bundled LibreSpeed, iperf3, and third-party notices.
 
 ## 2026-05-07
 
