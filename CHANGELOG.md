@@ -46,6 +46,7 @@
 - Improved LAN Throughput guidance and iperf3 connection errors so the gateway/router is not presented as the default test server.
 - Added a Gateway Stability tool for repeated first-hop ping monitoring with latency, packet loss, jitter, spike counts, raw ping log, diagnosis, Help, and Report support.
 - Added a Loaded Latency bufferbloat tool that compares idle ping latency with latency while LibreSpeed load is running, with loss/jitter, diagnosis, Help, and Report support.
+- Fixed Loaded Latency download/upload result formatting so LibreSpeed Mbps values display correctly.
 
 ## 2026-05-07
 

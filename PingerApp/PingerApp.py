@@ -360,6 +360,11 @@ def format_bits_per_second(value):
         return f"{mbps / 1000:.2f} Gbps"
     return f"{mbps:.2f} Mbps"
 
+def format_mbps(value):
+    if value is None:
+        return "N/A"
+    return f"{float(value):.2f} Mbps"
+
 def format_bytes_decimal(value):
     if value is None:
         return "N/A"
@@ -1572,8 +1577,8 @@ class LoadedLatencyWorker(QThread):
             "idle": idle,
             "loaded": loaded,
             "increase_ms": delta,
-            "download": format_bits_per_second((speed_data or {}).get("download")),
-            "upload": format_bits_per_second((speed_data or {}).get("upload")),
+            "download": format_mbps((speed_data or {}).get("download")),
+            "upload": format_mbps((speed_data or {}).get("upload")),
             "speed_raw": json.dumps(speed_data or {}, indent=2),
         }
         result["diagnosis"] = self._diagnosis(result)
@@ -5613,9 +5618,7 @@ class PingerApp(QWidget):
             self.speedtest_status_label.setStyleSheet(style)
 
     def _format_mbps(self, value):
-        if value is None:
-            return "N/A"
-        return f"{float(value):.2f} Mbps"
+        return format_mbps(value)
 
     def _format_bytes(self, value):
         if value is None:
