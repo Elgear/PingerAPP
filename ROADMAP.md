@@ -18,6 +18,7 @@ Current tools:
 
 - Speed Test
 - Network Scanner
+- HTTP Test
 - DNS / WHOIS
 - Traceroute
 - Alerts
@@ -26,27 +27,20 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 
 ## Next Features
 
-1. HTTP Test
-   - URL input.
-   - Method: GET / HEAD.
-   - Follow redirects checkbox.
-   - Timeout.
-   - Results: status code, response time, final URL, redirect count, TLS certificate summary for HTTPS, server/header summary, and error details.
-
-2. DNS Compare
+1. DNS Compare
    - Hostname input.
    - Record type.
    - Compare resolvers: System, Cloudflare, Google, Quad9.
    - Results: resolver, response time, answers, and error.
    - Start with `nslookup` subprocesses before adding dependencies.
 
-3. MTU Test
+2. MTU Test
    - Target.
    - Start/max size.
    - Windows-first implementation using `ping -f -l`.
    - Results: largest non-fragmenting payload, estimated MTU, and raw command output/details.
 
-4. Report
+3. Report
    - Checkboxes for sections:
      - Host Info
      - Ping stats
@@ -56,6 +50,10 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
      - Network Scanner results
    - Preview.
    - Save as `.txt`.
+
+## Completed Tool Milestones
+
+- HTTP Test: URL input, GET/HEAD, redirect control, timeout, status code, response time, final URL, redirect count, TLS certificate summary, headers, and error details.
 
 ## Packaging
 

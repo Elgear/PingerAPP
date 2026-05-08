@@ -8,6 +8,8 @@ import subprocess
 import platform
 import re
 import urllib.request
+import urllib.error
+import urllib.parse
 import ping3
 import math
 import json
@@ -123,6 +125,40 @@ def first_host_in_range(ip_text):
         return "N/A"
     network = ipaddress.ip_network(f"{ip}/24", strict=False)
     return str(next(network.hosts()))
+
+def common_name_from_cert_name(name):
+    for item in name or ():
+        for key, value in item:
+            if key == "commonName":
+                return value
+    return "N/A"
+
+def get_tls_summary(url, timeout=5):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return "N/A"
+
+    port = parsed.port or 443
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((parsed.hostname, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=parsed.hostname) as tls_sock:
+                cert = tls_sock.getpeercert()
+                version = tls_sock.version() or "TLS"
+    except Exception:
+        try:
+            context = ssl._create_unverified_context()
+            with socket.create_connection((parsed.hostname, port), timeout=timeout) as sock:
+                with context.wrap_socket(sock, server_hostname=parsed.hostname) as tls_sock:
+                    cert = tls_sock.getpeercert()
+                    version = tls_sock.version() or "TLS"
+        except Exception as e:
+            return f"TLS lookup failed: {e}"
+
+    subject = common_name_from_cert_name(cert.get("subject"))
+    issuer = common_name_from_cert_name(cert.get("issuer"))
+    expires = cert.get("notAfter", "N/A")
+    return f"{version}; Subject: {subject}; Issuer: {issuer}; Expires: {expires}"
 
 def get_arp_mac(ip):
     if platform.system() != "Windows":
@@ -804,6 +840,96 @@ class SpeedTestServerListWorker(QThread):
         self.servers_ready.emit(servers)
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class TrackingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self):
+        super().__init__()
+        self.redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.redirect_count += 1
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class HttpTestWorker(QThread):
+    """Runs an HTTP/HTTPS request in the background and returns timing and headers."""
+    result_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, url: str, method="HEAD", follow_redirects=True, timeout_ms=5000):
+        super().__init__()
+        self.url = url
+        self.method = method
+        self.follow_redirects = follow_redirects
+        self.timeout_ms = timeout_ms
+
+    def _normalized_url(self):
+        url = self.url.strip()
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            url = "https://" + url
+        return url
+
+    def run(self):
+        url = self._normalized_url()
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            self.error_ready.emit("Enter a valid HTTP or HTTPS URL.")
+            return
+
+        timeout_seconds = max(0.5, self.timeout_ms / 1000)
+        redirect_handler = TrackingRedirectHandler() if self.follow_redirects else NoRedirectHandler()
+        opener = urllib.request.build_opener(redirect_handler)
+        request = urllib.request.Request(
+            url,
+            method=self.method,
+            headers={"User-Agent": "PingerApp/1.0"},
+        )
+
+        started = time.perf_counter()
+        response = None
+        error = ""
+        try:
+            response = opener.open(request, timeout=timeout_seconds)
+            if self.method == "GET":
+                response.read(4096)
+        except urllib.error.HTTPError as e:
+            response = e
+            error = f"HTTP error response: {e.code} {e.reason}"
+        except urllib.error.URLError as e:
+            self.error_ready.emit(f"HTTP request failed: {e.reason}")
+            return
+        except Exception as e:
+            self.error_ready.emit(f"HTTP request failed: {e}")
+            return
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+
+        headers = response.headers if response is not None else {}
+        header_lines = [f"{key}: {value}" for key, value in headers.items()]
+        final_url = response.geturl() if response is not None else "N/A"
+        result = {
+            "url": url,
+            "method": self.method,
+            "status_code": getattr(response, "status", getattr(response, "code", "N/A")),
+            "reason": getattr(response, "reason", ""),
+            "response_time_ms": elapsed_ms,
+            "final_url": final_url,
+            "redirect_count": getattr(redirect_handler, "redirect_count", 0),
+            "tls": get_tls_summary(final_url if final_url != "N/A" else url, timeout=timeout_seconds),
+            "headers": "\n".join(header_lines) or "N/A",
+            "error": error or "N/A",
+        }
+        try:
+            response.close()
+        except Exception:
+            pass
+        self.result_ready.emit(result)
+
+
 class PingerApp(QWidget):
     """§3 Main application window for Home Pinger."""
     def __init__(self):
@@ -823,6 +949,7 @@ class PingerApp(QWidget):
         self.start_worker = None
         self.tr_worker = None
         self.port_check_worker = None
+        self.http_test_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
         self.speedtest_progress_timer = None
@@ -901,6 +1028,24 @@ class PingerApp(QWidget):
         self.port_tool_btn.setFixedSize(135, 30)
         self.port_tool_btn.setToolTip("Open network discovery and TCP port scanning")
         self.port_tool_btn.clicked.connect(self.show_port_check_window)
+        self.http_window = None
+        self.http_url_input = None
+        self.http_method_combo = None
+        self.http_follow_redirects_check = None
+        self.http_timeout_spin = None
+        self.http_run_btn = None
+        self.http_status_label = None
+        self.http_status_code_field = None
+        self.http_response_time_field = None
+        self.http_final_url_field = None
+        self.http_redirects_field = None
+        self.http_tls_field = None
+        self.http_error_field = None
+        self.http_headers_box = None
+        self.http_tool_btn = QPushButton("HTTP Test")
+        self.http_tool_btn.setFixedSize(135, 30)
+        self.http_tool_btn.setToolTip("Open HTTP/HTTPS request diagnostics")
+        self.http_tool_btn.clicked.connect(self.show_http_test_window)
 
         # §3.A.c Live displays: latency, elapsed time, reverse DNS
         self.live_latency    = QLineEdit("Idle")
@@ -1361,6 +1506,7 @@ class PingerApp(QWidget):
         tools_layout.setSpacing(10)
         tools_layout.addWidget(self.speedtest_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
@@ -2115,6 +2261,187 @@ class PingerApp(QWidget):
             else:
                 self.port_progress_bar.setValue(100)
                 self.port_progress_bar.setFormat("Complete")
+
+    def show_http_test_window(self):
+        """Open the HTTP/HTTPS diagnostic window."""
+        if self.http_window is None:
+            self.http_window = QWidget(None, Qt.Window)
+            self.http_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.http_window.setWindowTitle("HTTP Test")
+            self.http_window.setMinimumSize(760, 620)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Request")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.http_url_input = QLineEdit(self._default_http_url())
+            self.http_url_input.setPlaceholderText("https://example.com")
+            self.http_url_input.setMinimumWidth(420)
+            self.http_method_combo = QComboBox()
+            self.http_method_combo.addItems(["HEAD", "GET"])
+            self.http_follow_redirects_check = QCheckBox("Follow redirects")
+            self.http_follow_redirects_check.setChecked(True)
+            self.http_timeout_spin = QSpinBox()
+            self.http_timeout_spin.setRange(500, 60000)
+            self.http_timeout_spin.setSingleStep(500)
+            self.http_timeout_spin.setValue(5000)
+            self.http_timeout_spin.setSuffix(" ms")
+            self.http_run_btn = QPushButton("Run HTTP Test")
+            self.http_run_btn.clicked.connect(self.start_http_test)
+
+            controls.addWidget(QLabel("URL"), 0, 0)
+            controls.addWidget(self.http_url_input, 0, 1, 1, 5)
+            controls.addWidget(QLabel("Method"), 1, 0)
+            controls.addWidget(self.http_method_combo, 1, 1)
+            controls.addWidget(QLabel("Timeout"), 1, 2)
+            controls.addWidget(self.http_timeout_spin, 1, 3)
+            controls.addWidget(self.http_follow_redirects_check, 1, 4)
+            controls.addWidget(self.http_run_btn, 1, 5)
+            controls.setColumnStretch(1, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.http_status_label = QLabel("Ready")
+            self.http_status_label.setAlignment(Qt.AlignCenter)
+            self.http_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.http_status_label)
+
+            results_group = QGroupBox("Results")
+            results = QGridLayout()
+            results.setHorizontalSpacing(8)
+            results.setVerticalSpacing(8)
+            self.http_status_code_field = self._readonly_result_field()
+            self.http_response_time_field = self._readonly_result_field()
+            self.http_final_url_field = self._readonly_result_field()
+            self.http_redirects_field = self._readonly_result_field()
+            self.http_tls_field = self._readonly_result_field()
+            self.http_error_field = self._readonly_result_field()
+
+            results.addWidget(QLabel("Status"), 0, 0)
+            results.addWidget(self.http_status_code_field, 0, 1)
+            results.addWidget(QLabel("Response Time"), 0, 2)
+            results.addWidget(self.http_response_time_field, 0, 3)
+            results.addWidget(QLabel("Redirects"), 1, 0)
+            results.addWidget(self.http_redirects_field, 1, 1)
+            results.addWidget(QLabel("Final URL"), 1, 2)
+            results.addWidget(self.http_final_url_field, 1, 3)
+            results.addWidget(QLabel("TLS"), 2, 0)
+            results.addWidget(self.http_tls_field, 2, 1, 1, 3)
+            results.addWidget(QLabel("Error"), 3, 0)
+            results.addWidget(self.http_error_field, 3, 1, 1, 3)
+            results.setColumnStretch(1, 1)
+            results.setColumnStretch(3, 1)
+            results_group.setLayout(results)
+            layout.addWidget(results_group)
+
+            headers_group = QGroupBox("Headers")
+            headers_layout = QVBoxLayout()
+            self.http_headers_box = QTextEdit()
+            self.http_headers_box.setReadOnly(True)
+            self.http_headers_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            headers_layout.addWidget(self.http_headers_box)
+            headers_group.setLayout(headers_layout)
+            layout.addWidget(headers_group, 1)
+
+            self.http_window.setLayout(layout)
+
+        if self.http_url_input is not None and not self.http_url_input.text().strip():
+            self.http_url_input.setText(self._default_http_url())
+        self.http_window.show()
+        self.http_window.raise_()
+        self.http_window.activateWindow()
+
+    def _readonly_result_field(self):
+        field = QLineEdit()
+        field.setReadOnly(True)
+        return field
+
+    def _default_http_url(self):
+        host = self.host_input.text().strip()
+        if not host:
+            return "https://example.com"
+        if re.match(r"^https?://", host, re.IGNORECASE):
+            return host
+        return "https://" + host
+
+    def start_http_test(self):
+        if self.http_test_worker is not None and self.http_test_worker.isRunning():
+            return
+        url = self.http_url_input.text().strip() if self.http_url_input is not None else ""
+        if not url:
+            QMessageBox.warning(self, "HTTP Test Error", "Enter a URL.")
+            return
+
+        self.http_run_btn.setEnabled(False)
+        self.http_status_label.setText("Running HTTP test...")
+        self.http_status_label.setStyleSheet(
+            "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+        for field in (
+            self.http_status_code_field,
+            self.http_response_time_field,
+            self.http_final_url_field,
+            self.http_redirects_field,
+            self.http_tls_field,
+            self.http_error_field,
+        ):
+            field.clear()
+        self.http_headers_box.clear()
+
+        self.http_test_worker = HttpTestWorker(
+            url,
+            method=self.http_method_combo.currentText(),
+            follow_redirects=self.http_follow_redirects_check.isChecked(),
+            timeout_ms=self.http_timeout_spin.value(),
+        )
+        self.http_test_worker.result_ready.connect(self._set_http_result)
+        self.http_test_worker.error_ready.connect(self._set_http_error)
+        self.http_test_worker.finished.connect(self.http_test_worker.deleteLater)
+        self.http_test_worker.finished.connect(lambda: setattr(self, "http_test_worker", None))
+        self.http_test_worker.start()
+
+    def _set_http_result(self, result: dict):
+        if self.http_run_btn is not None:
+            self.http_run_btn.setEnabled(True)
+        status_text = f"{result.get('status_code', 'N/A')} {result.get('reason', '')}".strip()
+        self.http_status_code_field.setText(status_text)
+        self.http_response_time_field.setText(f"{result.get('response_time_ms', 0):.1f} ms")
+        self.http_final_url_field.setText(result.get("final_url", "N/A"))
+        self.http_redirects_field.setText(str(result.get("redirect_count", 0)))
+        self.http_tls_field.setText(result.get("tls", "N/A"))
+        self.http_error_field.setText(result.get("error", "N/A"))
+        self.http_headers_box.setPlainText(result.get("headers", "N/A"))
+
+        is_error = result.get("error") not in (None, "", "N/A")
+        if self.http_status_label is not None:
+            self.http_status_label.setText("HTTP test completed." if not is_error else "HTTP test completed with HTTP error response.")
+            self.http_status_label.setStyleSheet(
+                "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+                if not is_error else
+                "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+
+    def _set_http_error(self, error: str):
+        if self.http_run_btn is not None:
+            self.http_run_btn.setEnabled(True)
+        if self.http_status_label is not None:
+            self.http_status_label.setText(error)
+            self.http_status_label.setStyleSheet(
+                "QLabel { background: #fce8e6; color: #a50e0e; border: 1px solid #d28b82; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+        if self.http_error_field is not None:
+            self.http_error_field.setText(error)
 
     def show_dns_window(self):
         """Open the DNS / WHOIS diagnostic window."""

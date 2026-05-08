@@ -42,6 +42,7 @@
 - Wrapped long Network Scanner Details text across multiple lines while preserving the full text in the tooltip.
 - Defaulted the Network Scanner host field from Host Info, preferring the gateway and falling back to the first host in the local IP range.
 - Updated the roadmap around the Tools model, marking Network Scanner as the Port Check replacement and putting HTTP Test, DNS Compare, MTU Test, and Report next.
+- Added an HTTP Test tool window with GET/HEAD requests, redirect control, timeout, status, response timing, final URL, TLS certificate summary, headers, and error details.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
