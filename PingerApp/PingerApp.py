@@ -114,6 +114,16 @@ def wrapped_detail_text(value, width=70):
         lines.extend(textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False) or [""])
     return "\n".join(lines)
 
+def first_host_in_range(ip_text):
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return "N/A"
+    if ip.version != 4:
+        return "N/A"
+    network = ipaddress.ip_network(f"{ip}/24", strict=False)
+    return str(next(network.hosts()))
+
 def get_arp_mac(ip):
     if platform.system() != "Windows":
         return "N/A"
@@ -1541,7 +1551,7 @@ class PingerApp(QWidget):
             layout.setContentsMargins(12,12,12,12)
             layout.setSpacing(10)
 
-            self.port_host_input = QLineEdit(self.host_input.text().strip())
+            self.port_host_input = QLineEdit(self._default_network_scan_host())
             self.port_host_input.setMinimumWidth(260)
             self.port_host_input.setPlaceholderText("Host, IP, or network base")
             self.port_target_mode_combo = QComboBox()
@@ -1707,10 +1717,18 @@ class PingerApp(QWidget):
             self.port_window.setLayout(layout)
 
         if self.port_host_input is not None and not self.port_host_input.text().strip():
-            self.port_host_input.setText(self.host_input.text().strip())
+            self.port_host_input.setText(self._default_network_scan_host())
         self.port_window.show()
         self.port_window.raise_()
         self.port_window.activateWindow()
+
+    def _default_network_scan_host(self):
+        gateway = self.gateway_label.text().strip() if hasattr(self, "gateway_label") else ""
+        local_ip = self.host_ip_label.text().strip() if hasattr(self, "host_ip_label") else ""
+        for value in (gateway, first_host_in_range(local_ip), local_ip, self.host_input.text().strip()):
+            if value and value not in {"N/A", "Loading...", "Host Not Found"}:
+                return value
+        return ""
 
     def _selected_port_text(self):
         if self.port_ports_combo is None:

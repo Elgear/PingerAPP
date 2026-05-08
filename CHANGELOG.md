@@ -29,6 +29,7 @@
 - Moved Network Scanner section labels and help buttons outside the framed control contents so the boxes contain only controls.
 - Added extra cell and header padding to the Network Scanner results table so auto-sized columns are easier to read.
 - Wrapped long Network Scanner Details text across multiple lines while preserving the full text in the tooltip.
+- Defaulted the Network Scanner host field from Host Info, preferring the gateway and falling back to the first host in the local IP range.
 
 ## 2026-05-07
 
