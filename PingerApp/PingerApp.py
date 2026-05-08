@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QGroupBox, QSlider, QTextEdit,
-    QSizePolicy, QGridLayout
+    QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox
 )
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -160,12 +160,25 @@ class SpeedTestWorker(QThread):
     result_ready = pyqtSignal(dict)
     error_ready = pyqtSignal(str)
 
-    def __init__(self, executable: str):
+    def __init__(self, executable: str, server_id=None, duration=15, share=False):
         super().__init__()
         self.executable = executable
+        self.server_id = server_id
+        self.duration = duration
+        self.share = share
 
     def run(self):
-        cmd = [self.executable, "--json", "--telemetry-level", "disabled", "--no-icmp"]
+        cmd = [
+            self.executable,
+            "--json",
+            "--telemetry-level", "disabled",
+            "--no-icmp",
+            "--duration", str(self.duration),
+        ]
+        if self.server_id:
+            cmd.extend(["--server", str(self.server_id)])
+        if self.share:
+            cmd.append("--share")
         try:
             kwargs = {
                 "capture_output": True,
@@ -219,6 +232,62 @@ class SpeedTestWorker(QThread):
         self.result_ready.emit(parsed)
 
 
+class SpeedTestServerListWorker(QThread):
+    """Fetches the LibreSpeed public server list in the background."""
+    servers_ready = pyqtSignal(list)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, executable: str):
+        super().__init__()
+        self.executable = executable
+
+    def run(self):
+        cmd = [self.executable, "--list"]
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 60,
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except FileNotFoundError:
+            self.error_ready.emit("LibreSpeed CLI executable was not found.")
+            return
+        except subprocess.TimeoutExpired:
+            self.error_ready.emit("LibreSpeed server list timed out after 60 seconds.")
+            return
+        except OSError as e:
+            self.error_ready.emit(f"Could not list LibreSpeed servers: {e}")
+            return
+
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or "LibreSpeed server list failed.").strip()
+            self.error_ready.emit(message)
+            return
+
+        servers = []
+        pattern = re.compile(r"^(\d+):\s+(.+)\s+\((https?://[^)]+)\)\s+\[Sponsor:\s+(.+?)\s+@\s+(.+?)\]$")
+        for line in completed.stdout.splitlines():
+            match = pattern.match(line.strip())
+            if not match:
+                continue
+            servers.append({
+                "id": match.group(1),
+                "name": match.group(2),
+                "url": match.group(3),
+                "sponsor": match.group(4),
+                "sponsor_url": match.group(5),
+            })
+
+        if not servers:
+            self.error_ready.emit("LibreSpeed CLI returned no parseable servers.")
+            return
+
+        self.servers_ready.emit(servers)
+
+
 class PingerApp(QWidget):
     """§3 Main application window for Home Pinger."""
     def __init__(self):
@@ -236,6 +305,7 @@ class PingerApp(QWidget):
         self.dns_worker = None
         self.start_worker = None
         self.speedtest_worker = None
+        self.speedtest_server_worker = None
 
         # §3.A.a Host input & Start/Pause controls
         self.host_input = QLineEdit("8.8.8.8")
@@ -463,6 +533,10 @@ class PingerApp(QWidget):
         self.speedtest_labels = {}
         self.speedtest_status_label = None
         self.speedtest_run_btn = None
+        self.speedtest_refresh_servers_btn = None
+        self.speedtest_server_combo = None
+        self.speedtest_duration_spin = None
+        self.speedtest_share_check = None
         self.speedtest_btn = QPushButton("Speed Test")
         self.speedtest_btn.setFixedSize(135, 30)
         self.speedtest_btn.setToolTip("Open internet speed test")
@@ -851,8 +925,8 @@ class PingerApp(QWidget):
             self.speedtest_window = QWidget(None, Qt.Window)
             self.speedtest_window.setAttribute(Qt.WA_DeleteOnClose, False)
             self.speedtest_window.setWindowTitle("Speed Test")
-            self.speedtest_window.setMinimumSize(460, 430)
-            self.speedtest_window.resize(460, 430)
+            self.speedtest_window.setMinimumSize(560, 620)
+            self.speedtest_window.resize(560, 620)
 
             layout = QVBoxLayout()
             layout.setContentsMargins(12,12,12,12)
@@ -866,6 +940,38 @@ class PingerApp(QWidget):
                 "border-radius: 4px; padding: 8px; font-weight: bold; }"
             )
             layout.addWidget(self.speedtest_status_label)
+
+            options_group = QGroupBox("Options")
+            options_grid = QGridLayout()
+            options_grid.setContentsMargins(10,10,10,10)
+            options_grid.setHorizontalSpacing(10)
+            options_grid.setVerticalSpacing(8)
+
+            self.speedtest_server_combo = QComboBox()
+            self.speedtest_server_combo.addItem("Auto select nearest server", None)
+            self.speedtest_server_combo.setMinimumWidth(360)
+            self.speedtest_server_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+
+            self.speedtest_refresh_servers_btn = QPushButton("Refresh Servers")
+            self.speedtest_refresh_servers_btn.clicked.connect(self.refresh_speedtest_servers)
+
+            self.speedtest_duration_spin = QSpinBox()
+            self.speedtest_duration_spin.setRange(5, 60)
+            self.speedtest_duration_spin.setValue(15)
+            self.speedtest_duration_spin.setSuffix(" sec")
+
+            self.speedtest_share_check = QCheckBox("Generate share URL")
+            self.speedtest_share_check.setToolTip("Disabled by default. Enables LibreSpeed share result generation.")
+
+            options_grid.addWidget(QLabel("Server"), 0, 0)
+            options_grid.addWidget(self.speedtest_server_combo, 0, 1)
+            options_grid.addWidget(self.speedtest_refresh_servers_btn, 0, 2)
+            options_grid.addWidget(QLabel("Duration"), 1, 0)
+            options_grid.addWidget(self.speedtest_duration_spin, 1, 1)
+            options_grid.addWidget(self.speedtest_share_check, 1, 2)
+            options_grid.setColumnStretch(1, 1)
+            options_group.setLayout(options_grid)
+            layout.addWidget(options_group)
 
             self.speedtest_run_btn = QPushButton("Run Speed Test")
             self.speedtest_run_btn.setMinimumHeight(34)
@@ -908,15 +1014,20 @@ class PingerApp(QWidget):
             ])
             add_result_section("Endpoint", [
                 ("server", "Server"),
+                ("server_url", "Server URL"),
                 ("isp", "ISP"),
                 ("result", "Result URL"),
+            ])
+            add_result_section("Details", [
+                ("timestamp", "Test Time"),
+                ("data_used", "Data Used"),
             ])
             self.speedtest_window.setLayout(layout)
 
         self.speedtest_window.layout().activate()
         self.speedtest_window.adjustSize()
-        if self.speedtest_window.width() < 460 or self.speedtest_window.height() < 430:
-            self.speedtest_window.resize(max(self.speedtest_window.width(), 460), max(self.speedtest_window.height(), 430))
+        if self.speedtest_window.width() < 560 or self.speedtest_window.height() < 620:
+            self.speedtest_window.resize(max(self.speedtest_window.width(), 560), max(self.speedtest_window.height(), 620))
         self.speedtest_window.show()
         self.speedtest_window.raise_()
         self.speedtest_window.activateWindow()
@@ -947,6 +1058,52 @@ class PingerApp(QWidget):
                     return candidate
         return shutil.which("librespeed-cli")
 
+    def refresh_speedtest_servers(self):
+        """Fetch the LibreSpeed server list for manual server selection."""
+        if self.speedtest_server_worker is not None and self.speedtest_server_worker.isRunning():
+            return
+
+        executable = self._find_speedtest_executable()
+        if not executable:
+            self._set_speedtest_status(
+                "LibreSpeed CLI not found. Put librespeed-cli.exe in tools/librespeed "
+                "or install librespeed-cli so it is available on PATH."
+            )
+            return
+
+        self._set_speedtest_status("Refreshing LibreSpeed server list...")
+        if self.speedtest_refresh_servers_btn is not None:
+            self.speedtest_refresh_servers_btn.setEnabled(False)
+        self.speedtest_server_worker = SpeedTestServerListWorker(executable)
+        self.speedtest_server_worker.servers_ready.connect(self._set_speedtest_servers)
+        self.speedtest_server_worker.error_ready.connect(self._set_speedtest_error)
+        self.speedtest_server_worker.finished.connect(self._finish_speedtest_server_refresh)
+        self.speedtest_server_worker.finished.connect(self.speedtest_server_worker.deleteLater)
+        self.speedtest_server_worker.finished.connect(lambda: setattr(self, "speedtest_server_worker", None))
+        self.speedtest_server_worker.start()
+
+    def _set_speedtest_servers(self, servers: list):
+        if self.speedtest_server_combo is None:
+            return
+
+        current_id = self.speedtest_server_combo.currentData()
+        self.speedtest_server_combo.blockSignals(True)
+        self.speedtest_server_combo.clear()
+        self.speedtest_server_combo.addItem("Auto select nearest server", None)
+        selected_index = 0
+        for server in servers:
+            label = f"{server['id']} - {server['name']} ({server['sponsor']})"
+            self.speedtest_server_combo.addItem(label, server["id"])
+            if current_id and server["id"] == current_id:
+                selected_index = self.speedtest_server_combo.count() - 1
+        self.speedtest_server_combo.setCurrentIndex(selected_index)
+        self.speedtest_server_combo.blockSignals(False)
+        self._set_speedtest_status(f"Loaded {len(servers)} LibreSpeed servers.")
+
+    def _finish_speedtest_server_refresh(self):
+        if self.speedtest_refresh_servers_btn is not None:
+            self.speedtest_refresh_servers_btn.setEnabled(True)
+
     def start_speed_test(self):
         """Run a manual LibreSpeed CLI test in the background."""
         if self.speedtest_worker is not None and self.speedtest_worker.isRunning():
@@ -962,7 +1119,10 @@ class PingerApp(QWidget):
 
         self._set_speedtest_status("Running speed test. This may use significant bandwidth...")
         self.speedtest_run_btn.setEnabled(False)
-        self.speedtest_worker = SpeedTestWorker(executable)
+        server_id = self.speedtest_server_combo.currentData() if self.speedtest_server_combo is not None else None
+        duration = self.speedtest_duration_spin.value() if self.speedtest_duration_spin is not None else 15
+        share = self.speedtest_share_check.isChecked() if self.speedtest_share_check is not None else False
+        self.speedtest_worker = SpeedTestWorker(executable, server_id=server_id, duration=duration, share=share)
         self.speedtest_worker.result_ready.connect(self._set_speedtest_result)
         self.speedtest_worker.error_ready.connect(self._set_speedtest_error)
         self.speedtest_worker.finished.connect(self._finish_speedtest)
@@ -978,12 +1138,12 @@ class PingerApp(QWidget):
                     "QLabel { background: #fce8e6; color: #a50e0e; border: 1px solid #d28b82; "
                     "border-radius: 4px; padding: 8px; font-weight: bold; }"
                 )
-            elif message.startswith("Running"):
+            elif message.startswith("Running") or message.startswith("Refreshing"):
                 style = (
                     "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
                     "border-radius: 4px; padding: 8px; font-weight: bold; }"
                 )
-            elif message.startswith("Speed test completed"):
+            elif message.startswith("Speed test completed") or message.startswith("Loaded"):
                 style = (
                     "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
                     "border-radius: 4px; padding: 8px; font-weight: bold; }"
@@ -1000,6 +1160,24 @@ class PingerApp(QWidget):
             return "N/A"
         return f"{float(value):.2f} Mbps"
 
+    def _format_bytes(self, value):
+        if value is None:
+            return "N/A"
+        size = float(value)
+        for unit in ("B", "KB", "MB", "GB"):
+            if abs(size) < 1000 or unit == "GB":
+                return f"{size:.2f} {unit}" if unit != "B" else f"{size:.0f} {unit}"
+            size /= 1000
+
+    def _format_timestamp(self, value):
+        if not value:
+            return "N/A"
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+        except ValueError:
+            return str(value)
+
     def _dict_get_any(self, data: dict, *keys):
         for key in keys:
             if key in data and data[key] not in (None, ""):
@@ -1010,12 +1188,10 @@ class PingerApp(QWidget):
         server = data.get("server", {}) or {}
         client = data.get("client", {}) or {}
 
-        server_parts = [
-            self._dict_get_any(server, "name", "Name"),
-            self._dict_get_any(server, "sponsorName", "sponsor", "Sponsor"),
-            self._dict_get_any(server, "server", "url", "URL"),
-        ]
-        server_text = ", ".join(part for part in server_parts if part) or "N/A"
+        server_name = self._dict_get_any(server, "name", "Name") or "N/A"
+        server_url = self._dict_get_any(server, "server", "url", "URL") or "N/A"
+        bytes_received = self._format_bytes(data.get("bytes_received"))
+        bytes_sent = self._format_bytes(data.get("bytes_sent"))
         isp = (
             self._dict_get_any(client, "isp", "ISP", "org", "Org")
             or self._dict_get_any(client, "ip", "IP")
@@ -1028,9 +1204,12 @@ class PingerApp(QWidget):
             "latency": "N/A" if data.get("ping") is None else f"{float(data.get('ping')):.1f} ms",
             "jitter": "N/A" if data.get("jitter") is None else f"{float(data.get('jitter')):.1f} ms",
             "loss": "N/A (not reported by LibreSpeed)",
-            "server": server_text,
+            "server": server_name,
+            "server_url": server_url,
             "isp": isp,
             "result": data.get("share") or "N/A",
+            "timestamp": self._format_timestamp(data.get("timestamp")),
+            "data_used": f"Down {bytes_received} / Up {bytes_sent}",
         }
 
         for key, value in values.items():

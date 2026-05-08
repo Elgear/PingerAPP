@@ -21,6 +21,7 @@
 - Reviewed Ookla Speedtest CLI redistribution terms and switched the planned packaged integration to LibreSpeed CLI.
 - Updated the Speed Test worker to call LibreSpeed CLI JSON output with telemetry disabled.
 - Bundled LibreSpeed CLI v1.0.13 for Windows x64 with checksum and LGPL-3.0 attribution notes.
+- Added LibreSpeed server refresh/selection, configurable duration, optional share URL generation, test timestamp, data used, and server URL display.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
@@ -33,6 +34,7 @@
 - Alert Log opens in a separate window from the right-side Alert Log button.
 - Speed Test opens in a separate window from the top Ping Panel button.
 - Speed Test uses the bundled LibreSpeed CLI at `tools/librespeed/librespeed-cli.exe`, with `librespeed-cli` on PATH as a fallback.
+- Speed Test can auto-select a server or use a refreshed LibreSpeed server list for manual selection.
 
 ## Verification Used
 

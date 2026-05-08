@@ -21,7 +21,7 @@ The Speed Test window uses the bundled open-source LibreSpeed CLI at:
 tools/librespeed/librespeed-cli.exe
 ```
 
-The app also falls back to `librespeed-cli` on `PATH` if the bundled executable is not present.
+The app also falls back to `librespeed-cli` on `PATH` if the bundled executable is not present. The Speed Test window supports automatic server selection, manual server refresh/selection, configurable test duration, data-used reporting, and optional share URL generation.
 
 The bundled binary is LibreSpeed CLI v1.0.13 for Windows x64. Its source release, checksum, and license are recorded in `tools/librespeed/VERSION.txt` and `tools/librespeed/LICENSE.librespeed-cli.txt`. LibreSpeed CLI is licensed under LGPL-3.0, so keep it replaceable as a separate executable in packaged builds.
 
