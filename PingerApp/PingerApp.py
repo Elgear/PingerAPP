@@ -13,12 +13,13 @@ import math
 import json
 import os
 import shutil
+import time
 import uuid
 
 from collections import deque
 from datetime import datetime
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt, QPointF, QRectF, QSize
-from PyQt5.QtGui import QPainter, QPen, QFont, QColor
+from PyQt5.QtGui import QPainter, QPen, QFont, QColor, QBrush
 from PyQt5.QtWidgets import (
     QApplication, QWidget,
     QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -273,6 +274,41 @@ class DnsWhoisWorker(QThread):
         self.result_ready.emit("\n\n".join(sections))
 
 
+class PortCheckWorker(QThread):
+    """Checks TCP connectivity for one or more ports without blocking the UI."""
+    result_ready = pyqtSignal(dict)
+
+    def __init__(self, host: str, ports: list, timeout_ms=3000):
+        super().__init__()
+        self.host = host
+        self.ports = ports
+        self.timeout_ms = timeout_ms
+
+    def run(self):
+        timeout_seconds = max(0.1, self.timeout_ms / 1000)
+        for port in self.ports:
+            started = time.perf_counter()
+            status = "Closed"
+            error = ""
+            latency = None
+            try:
+                with socket.create_connection((self.host, port), timeout=timeout_seconds):
+                    latency = (time.perf_counter() - started) * 1000
+                    status = "Open"
+            except socket.timeout:
+                error = "Timed out"
+            except OSError as e:
+                error = str(e)
+
+            self.result_ready.emit({
+                "host": self.host,
+                "port": port,
+                "status": status,
+                "latency": latency,
+                "error": error,
+            })
+
+
 class StartResolveWorker(QThread):
     """Resolves the ping target before the ping timer starts."""
     resolved = pyqtSignal(str, str)
@@ -459,6 +495,7 @@ class PingerApp(QWidget):
         self.dns_whois_worker = None
         self.start_worker = None
         self.tr_worker = None
+        self.port_check_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
         self.speedtest_progress_timer = None
@@ -497,6 +534,17 @@ class PingerApp(QWidget):
         self.dns_tool_btn.setFixedSize(135, 30)
         self.dns_tool_btn.setToolTip("Open DNS, record, and IP ownership lookup")
         self.dns_tool_btn.clicked.connect(self.show_dns_window)
+        self.port_window = None
+        self.port_host_input = None
+        self.port_ports_combo = None
+        self.port_timeout_spin = None
+        self.port_run_btn = None
+        self.port_status_label = None
+        self.port_table = None
+        self.port_tool_btn = QPushButton("Port Check")
+        self.port_tool_btn.setFixedSize(135, 30)
+        self.port_tool_btn.setToolTip("Open TCP port connectivity checks")
+        self.port_tool_btn.clicked.connect(self.show_port_check_window)
 
         # §3.A.c Live displays: latency, elapsed time, reverse DNS
         self.live_latency    = QLineEdit("Idle")
@@ -956,6 +1004,7 @@ class PingerApp(QWidget):
         tools_layout.setContentsMargins(8,8,8,8)
         tools_layout.setSpacing(10)
         tools_layout.addWidget(self.speedtest_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
@@ -1079,6 +1128,176 @@ class PingerApp(QWidget):
         label.setStyleSheet(
             f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 3px; padding: 2px 4px; }}"
         )
+
+    def show_port_check_window(self):
+        """Open the TCP Port Check diagnostic window."""
+        if self.port_window is None:
+            self.port_window = QWidget(None, Qt.Window)
+            self.port_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.port_window.setWindowTitle("Port Check")
+            self.port_window.setMinimumSize(700, 460)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.port_host_input = QLineEdit(self.host_input.text().strip())
+            self.port_host_input.setMinimumWidth(300)
+            self.port_ports_combo = QComboBox()
+            self.port_ports_combo.setEditable(True)
+            self.port_ports_combo.addItems([
+                "80,443",
+                "443",
+                "80",
+                "22",
+                "3389",
+                "53",
+                "25,587,993",
+                "8080,8443",
+            ])
+            self.port_ports_combo.setMinimumWidth(160)
+            self.port_timeout_spin = QSpinBox()
+            self.port_timeout_spin.setRange(250, 30000)
+            self.port_timeout_spin.setSingleStep(250)
+            self.port_timeout_spin.setValue(3000)
+            self.port_timeout_spin.setSuffix(" ms")
+            self.port_run_btn = QPushButton("Run Check")
+            self.port_run_btn.clicked.connect(self.start_port_check)
+
+            controls.addWidget(QLabel("Host"), 0, 0)
+            controls.addWidget(self.port_host_input, 0, 1)
+            controls.addWidget(QLabel("Port(s)"), 0, 2)
+            controls.addWidget(self.port_ports_combo, 0, 3)
+            controls.addWidget(QLabel("Timeout"), 1, 0)
+            controls.addWidget(self.port_timeout_spin, 1, 1)
+            controls.addWidget(self.port_run_btn, 1, 3)
+            controls.setColumnStretch(1, 1)
+            layout.addLayout(controls)
+
+            self.port_status_label = QLabel("Ready")
+            self.port_status_label.setAlignment(Qt.AlignCenter)
+            self.port_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.port_status_label)
+
+            self.port_table = QTableWidget(0, 5)
+            self.port_table.setHorizontalHeaderLabels(["Host", "Port", "Status", "Latency", "Error"])
+            self.port_table.verticalHeader().setVisible(False)
+            self.port_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.port_table.setSelectionBehavior(QTableWidget.SelectRows)
+            ph = self.port_table.horizontalHeader()
+            ph.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(4, QHeaderView.Stretch)
+            layout.addWidget(self.port_table, 1)
+            self.port_window.setLayout(layout)
+
+        if self.port_host_input is not None and not self.port_host_input.text().strip():
+            self.port_host_input.setText(self.host_input.text().strip())
+        self.port_window.show()
+        self.port_window.raise_()
+        self.port_window.activateWindow()
+
+    def _parse_port_list(self, text: str):
+        ports = []
+        for part in re.split(r"[,;\s]+", text.strip()):
+            if not part:
+                continue
+            if "-" in part:
+                start_text, end_text = part.split("-", 1)
+                start, end = int(start_text), int(end_text)
+                if start > end:
+                    start, end = end, start
+                ports.extend(range(start, end + 1))
+            else:
+                ports.append(int(part))
+
+        deduped = []
+        for port in ports:
+            if port < 1 or port > 65535:
+                raise ValueError(f"Port out of range: {port}")
+            if port not in deduped:
+                deduped.append(port)
+        if not deduped:
+            raise ValueError("Enter at least one port.")
+        return deduped[:50]
+
+    def start_port_check(self):
+        """Run TCP connectivity checks in the Port Check window."""
+        if self.port_check_worker is not None and self.port_check_worker.isRunning():
+            return
+
+        host = self.port_host_input.text().strip() if self.port_host_input is not None else self.host_input.text().strip()
+        if not host:
+            return
+
+        try:
+            ports = self._parse_port_list(self.port_ports_combo.currentText())
+        except ValueError as e:
+            QMessageBox.warning(self, "Port Check Error", str(e))
+            return
+
+        timeout_ms = self.port_timeout_spin.value() if self.port_timeout_spin is not None else 3000
+        self.port_table.setRowCount(0)
+        self.port_run_btn.setEnabled(False)
+        self.port_status_label.setText(f"Checking {len(ports)} port(s) on {host}...")
+        self.port_status_label.setStyleSheet(
+            "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+        self.port_check_worker = PortCheckWorker(host, ports, timeout_ms=timeout_ms)
+        self.port_check_worker.result_ready.connect(self._add_port_check_result)
+        self.port_check_worker.finished.connect(self._finish_port_check)
+        self.port_check_worker.finished.connect(self.port_check_worker.deleteLater)
+        self.port_check_worker.finished.connect(lambda: setattr(self, "port_check_worker", None))
+        self.port_check_worker.start()
+
+    def _add_port_check_result(self, result: dict):
+        if self.port_table is None:
+            return
+        latency = "N/A" if result.get("latency") is None else f"{result['latency']:.1f} ms"
+        row_values = [
+            result.get("host", ""),
+            str(result.get("port", "")),
+            result.get("status", ""),
+            latency,
+            result.get("error", ""),
+        ]
+        row = self.port_table.rowCount()
+        self.port_table.insertRow(row)
+        for col, value in enumerate(row_values):
+            item = QTableWidgetItem(value)
+            if col == 2:
+                if value == "Open":
+                    item.setBackground(QBrush(QColor("#e6f4ea")))
+                else:
+                    item.setBackground(QBrush(QColor("#fce8e6")))
+            self.port_table.setItem(row, col, item)
+
+    def _finish_port_check(self):
+        if self.port_run_btn is not None:
+            self.port_run_btn.setEnabled(True)
+        if self.port_status_label is not None:
+            open_count = 0
+            total = self.port_table.rowCount() if self.port_table is not None else 0
+            if self.port_table is not None:
+                for row in range(total):
+                    item = self.port_table.item(row, 2)
+                    if item is not None and item.text() == "Open":
+                        open_count += 1
+            self.port_status_label.setText(f"Completed. {open_count}/{total} port(s) open.")
+            self.port_status_label.setStyleSheet(
+                "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
 
     def show_dns_window(self):
         """Open the DNS / WHOIS diagnostic window."""
