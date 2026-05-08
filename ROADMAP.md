@@ -53,7 +53,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 
 ## Completed Tool Milestones
 
-- HTTP Test: URL input, GET/HEAD, redirect control, timeout, status code, response time, final URL, redirect count, TLS certificate summary, headers, and error details.
+- HTTP Test: URL input, GET/HEAD, redirect control, optional self-signed certificate allowance for local HTTPS tests, timeout, status code, response time, final URL, redirect count, TLS certificate summary, headers, and error details.
 
 ## Packaging
 

@@ -133,14 +133,14 @@ def common_name_from_cert_name(name):
                 return value
     return "N/A"
 
-def get_tls_summary(url, timeout=5):
+def get_tls_summary(url, timeout=5, verify=True):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme.lower() != "https" or not parsed.hostname:
         return "N/A"
 
     port = parsed.port or 443
     try:
-        context = ssl.create_default_context()
+        context = ssl.create_default_context() if verify else ssl._create_unverified_context()
         with socket.create_connection((parsed.hostname, port), timeout=timeout) as sock:
             with context.wrap_socket(sock, server_hostname=parsed.hostname) as tls_sock:
                 cert = tls_sock.getpeercert()
@@ -158,7 +158,8 @@ def get_tls_summary(url, timeout=5):
     subject = common_name_from_cert_name(cert.get("subject"))
     issuer = common_name_from_cert_name(cert.get("issuer"))
     expires = cert.get("notAfter", "N/A")
-    return f"{version}; Subject: {subject}; Issuer: {issuer}; Expires: {expires}"
+    trust = "verified" if verify else "not verified"
+    return f"{version} ({trust}); Subject: {subject}; Issuer: {issuer}; Expires: {expires}"
 
 def get_arp_mac(ip):
     if platform.system() != "Windows":
@@ -860,12 +861,13 @@ class HttpTestWorker(QThread):
     result_ready = pyqtSignal(dict)
     error_ready = pyqtSignal(str)
 
-    def __init__(self, url: str, method="HEAD", follow_redirects=True, timeout_ms=5000):
+    def __init__(self, url: str, method="HEAD", follow_redirects=True, timeout_ms=5000, verify_tls=True):
         super().__init__()
         self.url = url
         self.method = method
         self.follow_redirects = follow_redirects
         self.timeout_ms = timeout_ms
+        self.verify_tls = verify_tls
 
     def _normalized_url(self):
         url = self.url.strip()
@@ -882,7 +884,10 @@ class HttpTestWorker(QThread):
 
         timeout_seconds = max(0.5, self.timeout_ms / 1000)
         redirect_handler = TrackingRedirectHandler() if self.follow_redirects else NoRedirectHandler()
-        opener = urllib.request.build_opener(redirect_handler)
+        handlers = [redirect_handler]
+        if not self.verify_tls:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        opener = urllib.request.build_opener(*handlers)
         request = urllib.request.Request(
             url,
             method=self.method,
@@ -919,7 +924,7 @@ class HttpTestWorker(QThread):
             "response_time_ms": elapsed_ms,
             "final_url": final_url,
             "redirect_count": getattr(redirect_handler, "redirect_count", 0),
-            "tls": get_tls_summary(final_url if final_url != "N/A" else url, timeout=timeout_seconds),
+            "tls": get_tls_summary(final_url if final_url != "N/A" else url, timeout=timeout_seconds, verify=self.verify_tls),
             "headers": "\n".join(header_lines) or "N/A",
             "error": error or "N/A",
         }
@@ -1032,6 +1037,7 @@ class PingerApp(QWidget):
         self.http_url_input = None
         self.http_method_combo = None
         self.http_follow_redirects_check = None
+        self.http_ignore_tls_check = None
         self.http_timeout_spin = None
         self.http_run_btn = None
         self.http_status_label = None
@@ -2285,6 +2291,8 @@ class PingerApp(QWidget):
             self.http_method_combo.addItems(["HEAD", "GET"])
             self.http_follow_redirects_check = QCheckBox("Follow redirects")
             self.http_follow_redirects_check.setChecked(True)
+            self.http_ignore_tls_check = QCheckBox("Ignore TLS certificate errors")
+            self.http_ignore_tls_check.setToolTip("Allow testing local HTTPS services with self-signed or invalid certificates.")
             self.http_timeout_spin = QSpinBox()
             self.http_timeout_spin.setRange(500, 60000)
             self.http_timeout_spin.setSingleStep(500)
@@ -2301,6 +2309,7 @@ class PingerApp(QWidget):
             controls.addWidget(self.http_timeout_spin, 1, 3)
             controls.addWidget(self.http_follow_redirects_check, 1, 4)
             controls.addWidget(self.http_run_btn, 1, 5)
+            controls.addWidget(self.http_ignore_tls_check, 2, 1, 1, 5)
             controls.setColumnStretch(1, 1)
             controls_group.setLayout(controls)
             layout.addWidget(controls_group)
@@ -2401,6 +2410,7 @@ class PingerApp(QWidget):
             method=self.http_method_combo.currentText(),
             follow_redirects=self.http_follow_redirects_check.isChecked(),
             timeout_ms=self.http_timeout_spin.value(),
+            verify_tls=not self.http_ignore_tls_check.isChecked(),
         )
         self.http_test_worker.result_ready.connect(self._set_http_result)
         self.http_test_worker.error_ready.connect(self._set_http_error)
