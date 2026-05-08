@@ -3278,7 +3278,7 @@ class PingerApp(QWidget):
         self.lan_status_label.setText(message)
         self.lan_status_label.setStyleSheet(
             f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
-            "border-radius: 4px; padding: 8px; font-weight: bold; }}"
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
         )
 
     def start_lan_throughput_test(self):
@@ -3548,7 +3548,7 @@ class PingerApp(QWidget):
         self.gateway_status_label.setText(message)
         self.gateway_status_label.setStyleSheet(
             f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
-            "border-radius: 4px; padding: 8px; font-weight: bold; }}"
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
         )
 
     def start_gateway_stability(self):
@@ -5541,7 +5541,7 @@ class PingerApp(QWidget):
 
     def do_ping(self):
         """Perform a single ping, update metrics, compute jitter, redraw."""
-        host = self.trace_input.text().strip() if self.trace_input is not None else self.host_input.text().strip()
+        host = self.host_input.text().strip()
         try:
             latency = ping3.ping(host, unit="ms")
         except OSError as e:
