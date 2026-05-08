@@ -30,6 +30,7 @@
 - Added extra cell and header padding to the Network Scanner results table so auto-sized columns are easier to read.
 - Wrapped long Network Scanner Details text across multiple lines while preserving the full text in the tooltip.
 - Defaulted the Network Scanner host field from Host Info, preferring the gateway and falling back to the first host in the local IP range.
+- Added an explicit Network Scanner manual port field so a single IP and one exact TCP port can be checked without editing the preset selector.
 - Updated the roadmap around the Tools model, marking Network Scanner as the Port Check replacement and putting HTTP Test, DNS Compare, MTU Test, and Report next.
 - Added an HTTP Test tool window with GET/HEAD requests, redirect control, timeout, status, response timing, final URL, TLS certificate summary, headers, and error details.
 - Added an HTTP Test option to ignore TLS certificate errors for local HTTPS services using self-signed certificates.

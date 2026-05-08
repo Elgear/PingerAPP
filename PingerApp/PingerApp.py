@@ -1846,8 +1846,10 @@ class PingerApp(QWidget):
         self.port_window = None
         self.port_host_input = None
         self.port_ports_combo = None
+        self.port_manual_ports_input = None
         self.port_ports_preview = None
         self.port_port_presets = {
+            "Manual ports": "",
             "Top troubleshooting": "20-23,25,53,80,110,139,143,443,445,587,993,995,3389,5900,8080,8443",
             "Common web": "80,443,8080,8443",
             "Common remote access": "22,23,3389,5900",
@@ -2662,14 +2664,20 @@ class PingerApp(QWidget):
             self.port_subnet_combo.setCurrentText("/24 256 addresses")
             self.port_subnet_combo.setToolTip("Subnet size to combine with the Host/IP field when Target is Subnet.")
             self.port_ports_combo = QComboBox()
-            self.port_ports_combo.setEditable(True)
+            self.port_ports_combo.setEditable(False)
             self.port_ports_combo.addItems(list(self.port_port_presets.keys()))
-            self.port_ports_combo.setMinimumWidth(300)
-            self.port_ports_combo.setToolTip("Choose a named preset or type a custom list such as 80,443,8000-8010.")
+            self.port_ports_combo.setMinimumWidth(180)
+            self.port_ports_combo.setMaximumWidth(230)
+            self.port_ports_combo.setCurrentText("Top troubleshooting")
+            self.port_ports_combo.setToolTip("Choose a named preset, or select Manual ports and type the exact TCP ports to scan.")
             self.port_ports_combo.currentTextChanged.connect(self._update_port_preview)
+            self.port_manual_ports_input = QLineEdit()
+            self.port_manual_ports_input.setPlaceholderText("443 or 80,443,8000-8010")
+            self.port_manual_ports_input.setToolTip("Manual TCP ports to scan. Use commas, spaces, or ranges such as 80,443,8000-8010.")
+            self.port_manual_ports_input.textEdited.connect(self._manual_ports_edited)
             self.port_ports_preview = QLineEdit()
             self.port_ports_preview.setReadOnly(True)
-            self.port_ports_preview.setToolTip("Exact TCP ports that will be scanned for the selected preset or custom entry.")
+            self.port_ports_preview.setToolTip("Exact TCP ports that will be scanned for the selected preset or manual entry.")
             self.port_timeout_spin = QSpinBox()
             self.port_timeout_spin.setRange(250, 30000)
             self.port_timeout_spin.setSingleStep(250)
@@ -2720,6 +2728,7 @@ class PingerApp(QWidget):
                 "Port presets: Top troubleshooting covers common remote, web, mail, file sharing, and DNS ports. "
                 "Common web scans HTTP/HTTPS alternates. Common remote access checks SSH, Telnet, RDP, and VNC. "
                 "Common mail checks SMTP/POP/IMAP variants. Common network services checks FTP/SSH/Telnet/DNS/NTP/SMB/RDP. "
+                "Select Manual ports to scan one specific port or a custom list. "
                 "The preview field shows the exact TCP ports that will be scanned."
             )
             scan_group = QGroupBox()
@@ -2727,7 +2736,9 @@ class PingerApp(QWidget):
             scan_layout.setHorizontalSpacing(8)
             scan_layout.setVerticalSpacing(6)
             scan_layout.addWidget(QLabel("Port preset"), 0, 0)
-            scan_layout.addWidget(self.port_ports_combo, 0, 1, 1, 5)
+            scan_layout.addWidget(self.port_ports_combo, 0, 1)
+            scan_layout.addWidget(QLabel("Manual ports"), 0, 2)
+            scan_layout.addWidget(self.port_manual_ports_input, 0, 3, 1, 3)
             scan_layout.addWidget(QLabel("Ports scanned"), 1, 0)
             scan_layout.addWidget(self.port_ports_preview, 1, 1, 1, 5)
             scan_layout.addWidget(QLabel("Timeout"), 2, 0)
@@ -2818,6 +2829,8 @@ class PingerApp(QWidget):
         if self.port_ports_combo is None:
             return ""
         text = self.port_ports_combo.currentText().strip()
+        if text == "Manual ports":
+            return self.port_manual_ports_input.text().strip() if self.port_manual_ports_input is not None else ""
         return self.port_port_presets.get(text, text)
 
     def _update_port_preview(self, *args):
@@ -2825,6 +2838,14 @@ class PingerApp(QWidget):
             return
         text = self._selected_port_text()
         self.port_ports_preview.setText(text)
+
+    def _manual_ports_edited(self, *args):
+        if self.port_ports_combo is None:
+            return
+        index = self.port_ports_combo.findText("Manual ports")
+        if index >= 0 and self.port_ports_combo.currentIndex() != index:
+            self.port_ports_combo.setCurrentIndex(index)
+        self._update_port_preview()
 
     def _parse_port_list(self, text: str):
         if ":" in text:
@@ -4846,7 +4867,8 @@ class PingerApp(QWidget):
         <ul>
             <li>Performs TCP connect checks against one host or a selected IPv4 subnet.</li>
             <li><b>Target</b>: choose Single host for one target, or Subnet for a CIDR range around the entered IP.</li>
-            <li><b>Ports</b>: choose a preset or type ports such as <code>80,443,8000-8010</code>.</li>
+            <li><b>Port preset</b>: choose a named set, or select Manual ports for an exact custom check.</li>
+            <li><b>Manual ports</b>: type one port or a list such as <code>443</code> or <code>80,443,8000-8010</code>.</li>
             <li><b>Parallel probes</b>: higher is faster, lower is gentler on small or fragile networks.</li>
             <li><b>Probe service banners</b>: tries light banner, HTTP, and TLS probes on open ports.</li>
             <li><b>Open</b>: TCP connection succeeded. <b>Closed</b>: host actively refused. <b>Filtered</b>: no response or dropped.</li>
