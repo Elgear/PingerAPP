@@ -530,6 +530,95 @@ class DnsCompareWorker(QThread):
             })
 
 
+class MtuTestWorker(QThread):
+    """Finds the largest non-fragmenting ICMP payload using system ping."""
+    result_ready = pyqtSignal(dict)
+    progress_ready = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, target: str, start_size=1200, max_size=1500, timeout_ms=3000):
+        super().__init__()
+        self.target = target
+        self.start_size = start_size
+        self.max_size = max_size
+        self.timeout_ms = timeout_ms
+
+    def _ping_payload(self, size):
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-f", "-l", str(size), "-w", str(self.timeout_ms), self.target]
+        else:
+            timeout_s = str(max(1, int(self.timeout_ms / 1000)))
+            cmd = ["ping", "-c", "1", "-M", "do", "-s", str(size), "-W", timeout_s, self.target]
+
+        try:
+            kwargs = {"capture_output": True, "text": True, "timeout": max(2, int(self.timeout_ms / 1000) + 2)}
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except subprocess.TimeoutExpired as e:
+            output = (e.stdout or e.stderr or "Timed out").strip()
+            return False, output
+        except OSError as e:
+            return False, str(e)
+
+        output = (completed.stdout or completed.stderr or "").strip()
+        lower = output.lower()
+        fragmented = any(
+            marker in lower
+            for marker in (
+                "fragment",
+                "packet needs to be fragmented",
+                "message too long",
+                "frag needed",
+            )
+        )
+        timed_out = any(marker in lower for marker in ("request timed out", "100% loss", "destination host unreachable"))
+        success = completed.returncode == 0 and not fragmented and not timed_out
+        return success, output
+
+    def run(self):
+        if not self.target:
+            self.error_ready.emit("Enter a target.")
+            return
+        if self.start_size < 0 or self.max_size < 0 or self.start_size > self.max_size:
+            self.error_ready.emit("Enter a valid start/max payload range.")
+            return
+
+        low = self.start_size
+        high = self.max_size
+        best = None
+        raw_sections = []
+
+        while low <= high:
+            size = (low + high) // 2
+            self.progress_ready.emit(f"Testing payload {size} bytes...")
+            success, output = self._ping_payload(size)
+            raw_sections.append(f"Payload {size} bytes: {'OK' if success else 'FAILED'}\n{output}")
+            if success:
+                best = size
+                low = size + 1
+            else:
+                high = size - 1
+
+        if best is None:
+            self.result_ready.emit({
+                "target": self.target,
+                "payload": "N/A",
+                "mtu": "N/A",
+                "status": "No payload in range succeeded",
+                "raw": "\n\n".join(raw_sections),
+            })
+            return
+
+        self.result_ready.emit({
+            "target": self.target,
+            "payload": best,
+            "mtu": best + 28,
+            "status": "Completed",
+            "raw": "\n\n".join(raw_sections),
+        })
+
+
 class PortCheckWorker(QThread):
     """Runs safe TCP network discovery and port scanning without blocking the UI."""
     result_ready = pyqtSignal(dict)
@@ -1020,6 +1109,7 @@ class PingerApp(QWidget):
         self.dns_worker = None
         self.dns_whois_worker = None
         self.dns_compare_worker = None
+        self.mtu_test_worker = None
         self.start_worker = None
         self.tr_worker = None
         self.port_check_worker = None
@@ -1073,6 +1163,21 @@ class PingerApp(QWidget):
         self.dns_compare_tool_btn.setFixedSize(135, 30)
         self.dns_compare_tool_btn.setToolTip("Compare DNS answers across resolvers")
         self.dns_compare_tool_btn.clicked.connect(self.show_dns_compare_window)
+        self.mtu_window = None
+        self.mtu_target_input = None
+        self.mtu_start_spin = None
+        self.mtu_max_spin = None
+        self.mtu_timeout_spin = None
+        self.mtu_run_btn = None
+        self.mtu_status_label = None
+        self.mtu_payload_field = None
+        self.mtu_estimated_field = None
+        self.mtu_result_status_field = None
+        self.mtu_raw_box = None
+        self.mtu_tool_btn = QPushButton("MTU Test")
+        self.mtu_tool_btn.setFixedSize(135, 30)
+        self.mtu_tool_btn.setToolTip("Find largest non-fragmenting ping payload")
+        self.mtu_tool_btn.clicked.connect(self.show_mtu_test_window)
         self.port_window = None
         self.port_host_input = None
         self.port_ports_combo = None
@@ -1595,6 +1700,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_compare_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.mtu_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
         tools_group.setLayout(tools_layout)
@@ -2677,6 +2783,163 @@ class PingerApp(QWidget):
                     "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
                     "border-radius: 4px; padding: 8px; font-weight: bold; }"
                 )
+
+    def show_mtu_test_window(self):
+        """Open the MTU discovery diagnostic window."""
+        if self.mtu_window is None:
+            self.mtu_window = QWidget(None, Qt.Window)
+            self.mtu_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.mtu_window.setWindowTitle("MTU Test")
+            self.mtu_window.setMinimumSize(760, 560)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Test")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.mtu_target_input = QLineEdit(self._default_network_scan_host() or self.host_input.text().strip())
+            self.mtu_target_input.setMinimumWidth(320)
+            self.mtu_start_spin = QSpinBox()
+            self.mtu_start_spin.setRange(0, 9000)
+            self.mtu_start_spin.setValue(1200)
+            self.mtu_start_spin.setSuffix(" bytes")
+            self.mtu_max_spin = QSpinBox()
+            self.mtu_max_spin.setRange(0, 9000)
+            self.mtu_max_spin.setValue(1500)
+            self.mtu_max_spin.setSuffix(" bytes")
+            self.mtu_timeout_spin = QSpinBox()
+            self.mtu_timeout_spin.setRange(500, 30000)
+            self.mtu_timeout_spin.setSingleStep(500)
+            self.mtu_timeout_spin.setValue(3000)
+            self.mtu_timeout_spin.setSuffix(" ms")
+            self.mtu_run_btn = QPushButton("Run MTU Test")
+            self.mtu_run_btn.clicked.connect(self.start_mtu_test)
+
+            controls.addWidget(QLabel("Target"), 0, 0)
+            controls.addWidget(self.mtu_target_input, 0, 1, 1, 5)
+            controls.addWidget(QLabel("Start payload"), 1, 0)
+            controls.addWidget(self.mtu_start_spin, 1, 1)
+            controls.addWidget(QLabel("Max payload"), 1, 2)
+            controls.addWidget(self.mtu_max_spin, 1, 3)
+            controls.addWidget(QLabel("Timeout"), 1, 4)
+            controls.addWidget(self.mtu_timeout_spin, 1, 5)
+            controls.addWidget(self.mtu_run_btn, 1, 6)
+            controls.setColumnStretch(1, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.mtu_status_label = QLabel("Ready")
+            self.mtu_status_label.setAlignment(Qt.AlignCenter)
+            self.mtu_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.mtu_status_label)
+
+            results_group = QGroupBox("Results")
+            results = QGridLayout()
+            results.setHorizontalSpacing(8)
+            results.setVerticalSpacing(8)
+            self.mtu_payload_field = self._readonly_result_field()
+            self.mtu_estimated_field = self._readonly_result_field()
+            self.mtu_result_status_field = self._readonly_result_field()
+            results.addWidget(QLabel("Largest Payload"), 0, 0)
+            results.addWidget(self.mtu_payload_field, 0, 1)
+            results.addWidget(QLabel("Estimated MTU"), 0, 2)
+            results.addWidget(self.mtu_estimated_field, 0, 3)
+            results.addWidget(QLabel("Status"), 1, 0)
+            results.addWidget(self.mtu_result_status_field, 1, 1, 1, 3)
+            results.setColumnStretch(1, 1)
+            results.setColumnStretch(3, 1)
+            results_group.setLayout(results)
+            layout.addWidget(results_group)
+
+            raw_group = QGroupBox("Raw Ping Output")
+            raw_layout = QVBoxLayout()
+            self.mtu_raw_box = QTextEdit()
+            self.mtu_raw_box.setReadOnly(True)
+            self.mtu_raw_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            raw_layout.addWidget(self.mtu_raw_box)
+            raw_group.setLayout(raw_layout)
+            layout.addWidget(raw_group, 1)
+
+            self.mtu_window.setLayout(layout)
+
+        if self.mtu_target_input is not None and not self.mtu_target_input.text().strip():
+            self.mtu_target_input.setText(self._default_network_scan_host() or self.host_input.text().strip())
+        self.mtu_window.show()
+        self.mtu_window.raise_()
+        self.mtu_window.activateWindow()
+
+    def start_mtu_test(self):
+        if self.mtu_test_worker is not None and self.mtu_test_worker.isRunning():
+            return
+        target = self.mtu_target_input.text().strip() if self.mtu_target_input is not None else ""
+        if not target:
+            QMessageBox.warning(self, "MTU Test Error", "Enter a target.")
+            return
+        if self.mtu_start_spin.value() > self.mtu_max_spin.value():
+            QMessageBox.warning(self, "MTU Test Error", "Start payload must be less than or equal to max payload.")
+            return
+
+        self.mtu_run_btn.setEnabled(False)
+        self.mtu_payload_field.clear()
+        self.mtu_estimated_field.clear()
+        self.mtu_result_status_field.clear()
+        self.mtu_raw_box.clear()
+        self.mtu_status_label.setText("Running MTU test...")
+        self.mtu_status_label.setStyleSheet(
+            "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+        self.mtu_test_worker = MtuTestWorker(
+            target,
+            start_size=self.mtu_start_spin.value(),
+            max_size=self.mtu_max_spin.value(),
+            timeout_ms=self.mtu_timeout_spin.value(),
+        )
+        self.mtu_test_worker.progress_ready.connect(self._set_mtu_progress)
+        self.mtu_test_worker.result_ready.connect(self._set_mtu_result)
+        self.mtu_test_worker.error_ready.connect(self._set_mtu_error)
+        self.mtu_test_worker.finished.connect(self.mtu_test_worker.deleteLater)
+        self.mtu_test_worker.finished.connect(lambda: setattr(self, "mtu_test_worker", None))
+        self.mtu_test_worker.start()
+
+    def _set_mtu_progress(self, message: str):
+        if self.mtu_status_label is not None:
+            self.mtu_status_label.setText(message)
+
+    def _set_mtu_result(self, result: dict):
+        if self.mtu_run_btn is not None:
+            self.mtu_run_btn.setEnabled(True)
+        self.mtu_payload_field.setText(str(result.get("payload", "N/A")))
+        self.mtu_estimated_field.setText(str(result.get("mtu", "N/A")))
+        self.mtu_result_status_field.setText(result.get("status", "N/A"))
+        self.mtu_raw_box.setPlainText(result.get("raw", ""))
+        success = result.get("payload") != "N/A"
+        if self.mtu_status_label is not None:
+            self.mtu_status_label.setText("MTU test completed." if success else "MTU test completed with no successful payload.")
+            self.mtu_status_label.setStyleSheet(
+                "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+                if success else
+                "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+
+    def _set_mtu_error(self, error: str):
+        if self.mtu_run_btn is not None:
+            self.mtu_run_btn.setEnabled(True)
+        if self.mtu_status_label is not None:
+            self.mtu_status_label.setText(error)
+            self.mtu_status_label.setStyleSheet(
+                "QLabel { background: #fce8e6; color: #a50e0e; border: 1px solid #d28b82; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
 
     def show_dns_window(self):
         """Open the DNS / WHOIS diagnostic window."""

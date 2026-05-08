@@ -22,6 +22,7 @@ The right-side Tools panel opens separate diagnostic windows:
 - HTTP Test: HTTP/HTTPS request diagnostics with GET/HEAD, redirect control, optional self-signed certificate allowance for local HTTPS tests, timing, final URL, TLS certificate summary, headers, and error details.
 - DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.
 - DNS Compare: compare DNS answers and response times across System DNS, Cloudflare, Google, and Quad9 using `nslookup`.
+- MTU Test: find the largest non-fragmenting ping payload and estimated path MTU, with raw ping output details.
 - Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
 - Alerts: threshold alert log.
 

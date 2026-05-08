@@ -21,6 +21,7 @@ Current tools:
 - HTTP Test
 - DNS / WHOIS
 - DNS Compare
+- MTU Test
 - Traceroute
 - Alerts
 
@@ -28,13 +29,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 
 ## Next Features
 
-1. MTU Test
-   - Target.
-   - Start/max size.
-   - Windows-first implementation using `ping -f -l`.
-   - Results: largest non-fragmenting payload, estimated MTU, and raw command output/details.
-
-2. Report
+1. Report
    - Checkboxes for sections:
      - Host Info
      - Ping stats
@@ -49,6 +44,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 
 - HTTP Test: URL input, GET/HEAD, redirect control, optional self-signed certificate allowance for local HTTPS tests, timeout, status code, response time, final URL, redirect count, TLS certificate summary, headers, and error details.
 - DNS Compare: hostname input, record type selector, System/Cloudflare/Google/Quad9 resolver comparison, response timing, answers, and error details using `nslookup`.
+- MTU Test: target input, start/max payload, Windows-first `ping -f -l` probing, largest non-fragmenting payload, estimated MTU, and raw ping output/details.
 
 ## Packaging
 

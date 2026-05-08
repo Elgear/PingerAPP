@@ -45,6 +45,7 @@
 - Added an HTTP Test tool window with GET/HEAD requests, redirect control, timeout, status, response timing, final URL, TLS certificate summary, headers, and error details.
 - Added an HTTP Test option to ignore TLS certificate errors for local HTTPS services using self-signed certificates.
 - Added a DNS Compare tool window using `nslookup` to compare System DNS, Cloudflare, Google, and Quad9 answers and response times.
+- Added an MTU Test tool window that probes non-fragmenting ping payload sizes and reports estimated path MTU with raw output details.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
