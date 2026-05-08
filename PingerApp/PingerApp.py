@@ -557,6 +557,42 @@ def gateway_stability_diagnosis(stats):
         )
     return "Gateway did not return successful latency samples. It may block ping, be unreachable, or be dropping local traffic."
 
+def route_health_diagnosis(result):
+    paths = result.get("paths", {})
+
+    def troubled(name):
+        stats = paths.get(name, {})
+        return stats.get("loss_pct", 0) > 0 or stats.get("spike_count", 0) > 0
+
+    gateway_bad = troubled("gateway")
+    isp_bad = troubled("isp")
+    public_bad = troubled("public")
+    gateway = paths.get("gateway", {})
+    isp = paths.get("isp", {})
+    public = paths.get("public", {})
+
+    if gateway_bad:
+        return (
+            "Gateway path degraded during load. Because the first hop shows loss or spikes, start with local causes: "
+            "Wi-Fi, Ethernet cable, switch/router LAN port, adapter, driver, or router CPU/queue pressure."
+        )
+    if isp_bad:
+        return (
+            "Gateway stayed cleaner than the ISP first hop, but the ISP hop degraded. That points beyond the local LAN: "
+            "router WAN side, modem/ONT, ISP edge, or provider congestion."
+        )
+    if public_bad:
+        return (
+            "Gateway and ISP first hop looked cleaner than the public target. That points farther upstream: route, peering, "
+            "remote network, or the selected public target."
+        )
+    if gateway.get("sent", 0) == 0 and isp.get("sent", 0) == 0 and public.get("sent", 0) == 0:
+        return "No route health samples were collected."
+    return (
+        "Route health looked stable during the load window. If throughput was still poor, focus on link negotiation, "
+        "router/WAN throughput, ISP profile, speed test server choice, or endpoint limits."
+    )
+
 
 class TracerouteWorker(QThread):
     """Runs tracert/traceroute in background and emits each line."""
@@ -1940,6 +1976,236 @@ class LoadedLatencyWorker(QThread):
         )
 
 
+class RouteHealthWorker(QThread):
+    """Pings gateway, ISP edge, and public target while LibreSpeed load runs."""
+    phase_ready = pyqtSignal(str)
+    sample_ready = pyqtSignal(dict)
+    result_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def __init__(
+        self,
+        executable: str,
+        gateway: str,
+        isp_hop: str,
+        public_target: str,
+        duration=15,
+        interval_ms=1000,
+        timeout_ms=1000,
+        spike_threshold_ms=75,
+    ):
+        super().__init__()
+        self.executable = executable
+        self.gateway = gateway.strip()
+        self.isp_hop = isp_hop.strip()
+        self.public_target = public_target.strip()
+        self.duration = duration
+        self.interval_ms = interval_ms
+        self.timeout_ms = timeout_ms
+        self.spike_threshold_ms = spike_threshold_ms
+        self._stop_requested = False
+        self._load_process = None
+
+    def stop(self):
+        self._stop_requested = True
+        proc = self._load_process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+    def run(self):
+        if not self.gateway:
+            self.error_ready.emit("Enter a gateway target.")
+            return
+        if not self.public_target:
+            self.error_ready.emit("Enter a public target.")
+            return
+
+        detected_note = ""
+        if not self.isp_hop:
+            self.phase_ready.emit("Detecting ISP first hop...")
+            self.isp_hop = self._detect_isp_hop()
+            detected_note = "Auto-detected ISP hop." if self.isp_hop else "Could not auto-detect ISP hop."
+
+        self.phase_ready.emit("Starting LibreSpeed load and route health probes...")
+        samples, speed_data, speed_error = self._run_loaded_route_test()
+        if self._stop_requested:
+            return
+        if speed_error:
+            self.error_ready.emit(speed_error)
+            return
+
+        result = self._build_result(samples, speed_data, detected_note)
+        self.result_ready.emit(result)
+
+    def _detect_isp_hop(self):
+        target = self.public_target
+        if platform.system() == "Windows":
+            cmd = ["tracert", "-d", "-h", "4", "-w", str(self.timeout_ms), target]
+        else:
+            cmd = ["traceroute", "-n", "-m", "4", "-w", str(max(1, int(self.timeout_ms / 1000))), target]
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 12,
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except Exception:
+            return ""
+
+        output = completed.stdout or completed.stderr or ""
+        gateway_ip = self.gateway.strip()
+        for line in output.splitlines():
+            ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line)
+            for ip in ips:
+                if ip != gateway_ip and ip != target:
+                    return ip
+        return ""
+
+    def _run_loaded_route_test(self):
+        cmd = [
+            self.executable,
+            "--json",
+            "--no-icmp",
+            "--duration", str(self.duration),
+            "--telemetry-level", "disabled",
+        ]
+        try:
+            kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            self._load_process = subprocess.Popen(cmd, **kwargs)
+        except FileNotFoundError:
+            return {}, None, "LibreSpeed CLI executable was not found."
+        except OSError as e:
+            return {}, None, f"Could not run LibreSpeed CLI: {e}"
+
+        samples = {
+            "gateway": {"label": "Gateway", "target": self.gateway, "samples": []},
+            "isp": {"label": "ISP first hop", "target": self.isp_hop, "samples": []},
+            "public": {"label": "Public target", "target": self.public_target, "samples": []},
+        }
+        started = time.monotonic()
+        max_seconds = max(60, int(self.duration) + 90)
+        index = 0
+        while not self._stop_requested and self._load_process.poll() is None:
+            if time.monotonic() - started > max_seconds:
+                self._load_process.terminate()
+                return samples, None, f"LibreSpeed load timed out after {max_seconds} seconds."
+            index += 1
+            for key, item in samples.items():
+                target = item.get("target", "")
+                if not target:
+                    continue
+                latency, raw = self._ping_once(target)
+                item["samples"].append(latency)
+                self.sample_ready.emit({
+                    "path": key,
+                    "label": item["label"],
+                    "target": target,
+                    "index": index,
+                    "latency": latency,
+                    "raw": raw,
+                    "status": "Timeout" if latency is None else f"{latency:.1f} ms",
+                })
+            self.msleep(max(0, int(self.interval_ms)))
+
+        if self._stop_requested:
+            return samples, None, None
+
+        try:
+            stdout, stderr = self._load_process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._load_process.kill()
+            stdout, stderr = self._load_process.communicate(timeout=5)
+
+        if self._load_process.returncode != 0:
+            message = (stderr or stdout or "LibreSpeed CLI failed during route health test.").strip()
+            return samples, None, message
+
+        output = (stdout or "").strip()
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            start = output.find("{")
+            end = output.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                return samples, None, "LibreSpeed CLI did not return JSON output."
+            try:
+                parsed = json.loads(output[start:end+1])
+            except json.JSONDecodeError:
+                return samples, None, "Could not parse LibreSpeed JSON output."
+
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else {}
+        if not isinstance(parsed, dict):
+            return samples, None, "LibreSpeed CLI returned an unsupported JSON shape."
+        return samples, parsed, None
+
+    def _ping_once(self, target):
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(self.timeout_ms), target]
+        else:
+            timeout_seconds = max(1, int(math.ceil(self.timeout_ms / 1000)))
+            cmd = ["ping", "-c", "1", "-W", str(timeout_seconds), target]
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": max(2, int(math.ceil(self.timeout_ms / 1000)) + 2),
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except Exception as e:
+            return None, f"Ping failed: {e}"
+
+        raw = (completed.stdout or completed.stderr or "").strip()
+        match = re.search(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms", raw, re.IGNORECASE)
+        if not match:
+            match = re.search(r"time\s+(\d+(?:\.\d+)?)\s*ms", raw, re.IGNORECASE)
+        if match and completed.returncode == 0:
+            return float(match.group(1)), raw
+        return None, raw or "No ping output"
+
+    def _sample_stats(self, item):
+        values = item.get("samples", [])
+        valid = [value for value in values if value is not None]
+        jitters = [abs(valid[index] - valid[index - 1]) for index in range(1, len(valid))]
+        spikes = [value for value in valid if value >= self.spike_threshold_ms]
+        return {
+            "label": item.get("label", "N/A"),
+            "target": item.get("target") or "N/A",
+            "sent": len(values),
+            "received": len(valid),
+            "lost": len(values) - len(valid),
+            "loss_pct": 0.0 if not values else ((len(values) - len(valid)) / len(values)) * 100,
+            "avg_ms": None if not valid else sum(valid) / len(valid),
+            "max_ms": None if not valid else max(valid),
+            "jitter_ms": None if not jitters else sum(jitters) / len(jitters),
+            "spike_count": len(spikes),
+            "spike_threshold_ms": self.spike_threshold_ms,
+        }
+
+    def _build_result(self, samples, speed_data, note):
+        paths = {key: self._sample_stats(item) for key, item in samples.items()}
+        result = {
+            "paths": paths,
+            "download": format_mbps((speed_data or {}).get("download")),
+            "upload": format_mbps((speed_data or {}).get("upload")),
+            "speed_raw": json.dumps(speed_data or {}, indent=2),
+            "note": note,
+        }
+        result["diagnosis"] = route_health_diagnosis(result)
+        return result
+
+
 class SpeedTestServerListWorker(QThread):
     """Fetches the LibreSpeed public server list in the background."""
     servers_ready = pyqtSignal(list)
@@ -2512,6 +2778,28 @@ class PingerApp(QWidget):
         self.gateway_stability_btn.setFixedSize(135, 30)
         self.gateway_stability_btn.setToolTip("Monitor default gateway latency, loss, jitter, and spikes")
         self.gateway_stability_btn.clicked.connect(self.show_gateway_stability_window)
+        self.route_health_worker = None
+        self.route_window = None
+        self.route_gateway_input = None
+        self.route_isp_input = None
+        self.route_public_input = None
+        self.route_duration_spin = None
+        self.route_interval_spin = None
+        self.route_timeout_spin = None
+        self.route_spike_spin = None
+        self.route_run_btn = None
+        self.route_stop_btn = None
+        self.route_status_label = None
+        self.route_summary_labels = {}
+        self.route_table = None
+        self.route_diagnosis_box = None
+        self.route_raw_box = None
+        self.route_last_result = None
+        self.route_last_error = None
+        self.route_health_btn = QPushButton("Route Health")
+        self.route_health_btn.setFixedSize(135, 30)
+        self.route_health_btn.setToolTip("Ping gateway, ISP hop, and public target during speed-test load")
+        self.route_health_btn.clicked.connect(self.show_route_health_window)
         self.loaded_window = None
         self.loaded_target_input = None
         self.loaded_baseline_spin = None
@@ -2785,6 +3073,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.lan_throughput_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.gateway_stability_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.loaded_latency_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.route_health_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
@@ -4424,6 +4713,287 @@ class PingerApp(QWidget):
         else:
             self._set_gateway_status("Gateway stability monitor stopped.", "info")
 
+    def show_route_health_window(self):
+        """Open route/hop health diagnostics during speed-test load."""
+        if self.route_window is None:
+            self.route_window = QWidget(None, Qt.Window)
+            self.route_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.route_window.setWindowTitle("Route Health")
+            self.route_window.setMinimumSize(900, 700)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Test")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.route_gateway_input = QLineEdit(self._default_gateway_target())
+            self.route_gateway_input.setPlaceholderText("Default gateway")
+            self.route_isp_input = QLineEdit()
+            self.route_isp_input.setPlaceholderText("Auto-detect if blank")
+            self.route_public_input = QLineEdit("1.1.1.1")
+            self.route_public_input.setPlaceholderText("Public target")
+            self.route_duration_spin = QSpinBox()
+            self.route_duration_spin.setRange(5, 60)
+            self.route_duration_spin.setValue(15)
+            self.route_duration_spin.setSuffix(" sec")
+            self.route_interval_spin = QSpinBox()
+            self.route_interval_spin.setRange(250, 5000)
+            self.route_interval_spin.setSingleStep(250)
+            self.route_interval_spin.setValue(1000)
+            self.route_interval_spin.setSuffix(" ms")
+            self.route_timeout_spin = QSpinBox()
+            self.route_timeout_spin.setRange(250, 10000)
+            self.route_timeout_spin.setSingleStep(250)
+            self.route_timeout_spin.setValue(1000)
+            self.route_timeout_spin.setSuffix(" ms")
+            self.route_spike_spin = QSpinBox()
+            self.route_spike_spin.setRange(1, 1000)
+            self.route_spike_spin.setValue(75)
+            self.route_spike_spin.setSuffix(" ms")
+            self.route_run_btn = QPushButton("Run Route Health")
+            self.route_run_btn.clicked.connect(self.start_route_health_test)
+            self.route_stop_btn = QPushButton("Stop")
+            self.route_stop_btn.setEnabled(False)
+            self.route_stop_btn.clicked.connect(self.stop_route_health_test)
+
+            controls.addWidget(QLabel("Gateway"), 0, 0)
+            controls.addWidget(self.route_gateway_input, 0, 1)
+            controls.addWidget(QLabel("ISP hop"), 0, 2)
+            controls.addWidget(self.route_isp_input, 0, 3)
+            controls.addWidget(QLabel("Public target"), 0, 4)
+            controls.addWidget(self.route_public_input, 0, 5)
+            controls.addWidget(QLabel("Load duration"), 1, 0)
+            controls.addWidget(self.route_duration_spin, 1, 1)
+            controls.addWidget(QLabel("Ping interval"), 1, 2)
+            controls.addWidget(self.route_interval_spin, 1, 3)
+            controls.addWidget(QLabel("Timeout"), 1, 4)
+            controls.addWidget(self.route_timeout_spin, 1, 5)
+            controls.addWidget(QLabel("Spike over"), 2, 0)
+            controls.addWidget(self.route_spike_spin, 2, 1)
+            controls.addWidget(self.route_run_btn, 2, 4)
+            controls.addWidget(self.route_stop_btn, 2, 5)
+            controls.setColumnStretch(1, 1)
+            controls.setColumnStretch(3, 1)
+            controls.setColumnStretch(5, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.route_status_label = QLabel("Ready")
+            self.route_status_label.setAlignment(Qt.AlignCenter)
+            self.route_status_label.setWordWrap(True)
+            self.route_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.route_status_label)
+
+            summary_group = QGroupBox("Speed Load")
+            summary = QGridLayout()
+            summary.setHorizontalSpacing(12)
+            summary.setVerticalSpacing(8)
+            self.route_summary_labels = {}
+            for row, (key, label_text) in enumerate((("download", "Download"), ("upload", "Upload"), ("note", "Detection"))):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.route_summary_labels[key] = value
+                summary.addWidget(name, row, 0)
+                summary.addWidget(value, row, 1)
+            summary.setColumnStretch(1, 1)
+            summary_group.setLayout(summary)
+            layout.addWidget(summary_group)
+
+            self.route_table = QTableWidget(0, 9)
+            self.route_table.setHorizontalHeaderLabels([
+                "Path", "Target", "Sent", "Received", "Loss", "Avg", "Max", "Jitter", "Spikes"
+            ])
+            self.route_table.verticalHeader().setVisible(False)
+            self.route_table.setAlternatingRowColors(True)
+            rh = self.route_table.horizontalHeader()
+            for col in range(0, 9):
+                rh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+            rh.setSectionResizeMode(1, QHeaderView.Stretch)
+            layout.addWidget(self.route_table)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.route_diagnosis_box = QTextEdit()
+            self.route_diagnosis_box.setReadOnly(True)
+            self.route_diagnosis_box.setMinimumHeight(90)
+            self.route_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.route_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group)
+
+            raw_group = QGroupBox("Ping Log / Speed Test JSON")
+            raw_layout = QVBoxLayout()
+            self.route_raw_box = QTextEdit()
+            self.route_raw_box.setReadOnly(True)
+            self.route_raw_box.setMinimumHeight(150)
+            self.route_raw_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            raw_layout.addWidget(self.route_raw_box)
+            raw_group.setLayout(raw_layout)
+            layout.addWidget(raw_group, 1)
+
+            self.route_window.setLayout(layout)
+
+        if self.route_gateway_input is not None and not self.route_gateway_input.text().strip():
+            self.route_gateway_input.setText(self._default_gateway_target())
+        self.route_window.show()
+        self.route_window.raise_()
+        self.route_window.activateWindow()
+
+    def _set_route_status(self, message: str, level="info"):
+        if self.route_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.route_status_label.setText(message)
+        self.route_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+    def start_route_health_test(self):
+        if self.route_health_worker is not None and self.route_health_worker.isRunning():
+            return
+        executable = self._find_speedtest_executable()
+        if not executable:
+            self._set_route_status(
+                "LibreSpeed CLI not found. Put librespeed-cli.exe in tools/librespeed or install librespeed-cli on PATH.",
+                "error",
+            )
+            return
+        gateway = self.route_gateway_input.text().strip() if self.route_gateway_input is not None else ""
+        public_target = self.route_public_input.text().strip() if self.route_public_input is not None else ""
+        if not gateway or not public_target:
+            QMessageBox.warning(self, "Route Health Error", "Enter a gateway and public target.")
+            return
+
+        self.route_last_result = None
+        self.route_last_error = None
+        for label in self.route_summary_labels.values():
+            label.setText("N/A")
+        if self.route_table is not None:
+            self.route_table.setRowCount(0)
+        if self.route_diagnosis_box is not None:
+            self.route_diagnosis_box.clear()
+        if self.route_raw_box is not None:
+            self.route_raw_box.clear()
+        self.route_run_btn.setEnabled(False)
+        self.route_stop_btn.setEnabled(True)
+        self._set_route_status("Starting route health test...", "running")
+
+        self.route_health_worker = RouteHealthWorker(
+            executable,
+            gateway,
+            self.route_isp_input.text().strip() if self.route_isp_input is not None else "",
+            public_target,
+            duration=self.route_duration_spin.value(),
+            interval_ms=self.route_interval_spin.value(),
+            timeout_ms=self.route_timeout_spin.value(),
+            spike_threshold_ms=self.route_spike_spin.value(),
+        )
+        self.route_health_worker.phase_ready.connect(lambda message: self._set_route_status(message, "running"))
+        self.route_health_worker.sample_ready.connect(self._add_route_health_sample)
+        self.route_health_worker.result_ready.connect(self._set_route_health_result)
+        self.route_health_worker.error_ready.connect(self._set_route_health_error)
+        self.route_health_worker.finished.connect(self._finish_route_health_test)
+        self.route_health_worker.finished.connect(self.route_health_worker.deleteLater)
+        self.route_health_worker.finished.connect(lambda: setattr(self, "route_health_worker", None))
+        self.route_health_worker.start()
+
+    def stop_route_health_test(self):
+        if self.route_health_worker is not None and self.route_health_worker.isRunning():
+            self.route_health_worker.stop()
+            self._set_route_status("Stopping route health test...", "running")
+
+    def _add_route_health_sample(self, sample: dict):
+        if self.route_raw_box is None:
+            return
+        self.route_raw_box.append(
+            f"{sample.get('label')} {sample.get('target')} sample {sample.get('index')}: {sample.get('status')}"
+        )
+
+    def _set_route_health_result(self, result: dict):
+        self.route_last_result = result
+        values = {
+            "download": result.get("download", "N/A"),
+            "upload": result.get("upload", "N/A"),
+            "note": result.get("note", "N/A") or "N/A",
+        }
+        for key, value in values.items():
+            label = self.route_summary_labels.get(key)
+            if label is not None:
+                label.setText(str(value))
+
+        paths = result.get("paths", {})
+        ordered = [("gateway", "Gateway"), ("isp", "ISP first hop"), ("public", "Public target")]
+        if self.route_table is not None:
+            self.route_table.setRowCount(len(ordered))
+            for row, (key, fallback_label) in enumerate(ordered):
+                stats = paths.get(key, {})
+                def ms_text(name):
+                    value = stats.get(name)
+                    return "N/A" if value is None else f"{value:.1f} ms"
+                cells = [
+                    stats.get("label", fallback_label),
+                    stats.get("target", "N/A"),
+                    str(stats.get("sent", 0)),
+                    str(stats.get("received", 0)),
+                    f"{stats.get('loss_pct', 0):.1f}%",
+                    ms_text("avg_ms"),
+                    ms_text("max_ms"),
+                    ms_text("jitter_ms"),
+                    f"{stats.get('spike_count', 0)} over {stats.get('spike_threshold_ms', 0):.0f} ms",
+                ]
+                for col, text in enumerate(cells):
+                    self.route_table.setItem(row, col, QTableWidgetItem(str(text)))
+            self.route_table.resizeRowsToContents()
+
+        if self.route_diagnosis_box is not None:
+            self.route_diagnosis_box.setPlainText(result.get("diagnosis", "N/A"))
+        if self.route_raw_box is not None:
+            self.route_raw_box.append("")
+            self.route_raw_box.append("LibreSpeed JSON:")
+            self.route_raw_box.append(result.get("speed_raw", ""))
+
+        problem = any(
+            stats.get("loss_pct", 0) > 0 or stats.get("spike_count", 0) > 0
+            for stats in paths.values()
+        )
+        self._set_route_status("Route health test completed.", "error" if problem else "ok")
+
+    def _set_route_health_error(self, message: str):
+        self.route_last_error = message
+        self._set_route_status(f"Route health failed: {message}", "error")
+        if self.route_diagnosis_box is not None:
+            self.route_diagnosis_box.setPlainText(
+                "Check that LibreSpeed CLI is available, the gateway/public targets respond to ping, and traceroute is allowed."
+            )
+
+    def _finish_route_health_test(self):
+        if self.route_run_btn is not None:
+            self.route_run_btn.setEnabled(True)
+        if self.route_stop_btn is not None:
+            self.route_stop_btn.setEnabled(False)
+        if self.route_last_result is None and self.route_last_error is None:
+            self._set_route_status("Route health test stopped.", "info")
+
     def show_loaded_latency_window(self):
         """Open the bufferbloat / loaded latency diagnostic window."""
         if self.loaded_window is None:
@@ -5401,6 +5971,14 @@ class PingerApp(QWidget):
             <li>Use this when calls, games, or remote desktop get laggy while downloads, uploads, cloud sync, or speed tests are running.</li>
         </ul>
 
+        <h3>Route Health</h3>
+        <ul>
+            <li>Runs LibreSpeed load while pinging the gateway, ISP first hop, and a public target.</li>
+            <li><b>ISP hop</b> can be left blank; the tool will try to auto-detect it with a short traceroute.</li>
+            <li>If the gateway degrades, investigate the local LAN path. If only the ISP hop degrades, investigate router WAN, modem/ONT, or ISP edge. If only the public target degrades, suspect upstream route or remote network conditions.</li>
+            <li>Use this when raw speed, loaded latency, or gateway checks are not enough to locate where the slowdown starts.</li>
+        </ul>
+
         <h3>Speed Test</h3>
         <ul>
             <li>Uses LibreSpeed CLI to measure download, upload, latency, and jitter.</li>
@@ -5466,7 +6044,7 @@ class PingerApp(QWidget):
         <h3>Report</h3>
         <ul>
             <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
-            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
+            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
             <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
             <li><b>Save as TXT</b> writes the current report to a text file.</li>
         </ul>
@@ -5502,6 +6080,7 @@ class PingerApp(QWidget):
                 ("lan_throughput", "LAN Throughput"),
                 ("gateway_stability", "Gateway Stability"),
                 ("loaded_latency", "Loaded Latency"),
+                ("route_health", "Route Health"),
                 ("speedtest_history", "Speed Test history"),
                 ("dns_lookup", "Last DNS lookup"),
                 ("traceroute", "Last traceroute"),
@@ -5594,6 +6173,7 @@ class PingerApp(QWidget):
             ("lan_throughput", "LAN Throughput", self._report_lan_throughput_lines),
             ("gateway_stability", "Gateway Stability", self._report_gateway_stability_lines),
             ("loaded_latency", "Loaded Latency", self._report_loaded_latency_lines),
+            ("route_health", "Route Health", self._report_route_health_lines),
             ("speedtest_history", "Speed Test History", self._report_speedtest_history_lines),
             ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
             ("traceroute", "Last Traceroute", self._report_traceroute_lines),
@@ -5779,6 +6359,32 @@ class PingerApp(QWidget):
             "Diagnosis:",
             result.get("diagnosis", "N/A"),
         ]
+
+    def _report_route_health_lines(self):
+        if not self.route_last_result:
+            return ["No Route Health result available."]
+        result = self.route_last_result
+        lines = [
+            f"Download: {result.get('download', 'N/A')}",
+            f"Upload: {result.get('upload', 'N/A')}",
+            f"Detection: {result.get('note', 'N/A') or 'N/A'}",
+            "",
+            "Paths:",
+        ]
+        for key in ("gateway", "isp", "public"):
+            stats = result.get("paths", {}).get(key, {})
+            def ms_value(name):
+                value = stats.get(name)
+                return "N/A" if value is None else f"{value:.1f} ms"
+            lines.extend([
+                f"{stats.get('label', key)} ({stats.get('target', 'N/A')}):",
+                f"  Sent/Received/Lost: {stats.get('sent', 0)}/{stats.get('received', 0)}/{stats.get('lost', 0)}",
+                f"  Loss: {stats.get('loss_pct', 0):.1f}%",
+                f"  Avg/Max/Jitter: {ms_value('avg_ms')} / {ms_value('max_ms')} / {ms_value('jitter_ms')}",
+                f"  Spikes: {stats.get('spike_count', 0)} over {stats.get('spike_threshold_ms', 0):.0f} ms",
+            ])
+        lines.extend(["", "Diagnosis:", result.get("diagnosis", "N/A")])
+        return lines
 
     def _report_speedtest_history_lines(self):
         rows = self._speedtest_history_rows()
@@ -6996,6 +7602,8 @@ class PingerApp(QWidget):
         self.elapsed_timer.stop()
         if self.loaded_latency_worker is not None and self.loaded_latency_worker.isRunning():
             self.loaded_latency_worker.stop()
+        if self.route_health_worker is not None and self.route_health_worker.isRunning():
+            self.route_health_worker.stop()
         if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
             self.gateway_stability_worker.stop()
         self.stop_lan_server()
