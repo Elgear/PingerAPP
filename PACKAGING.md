@@ -76,4 +76,46 @@ Check at minimum:
 
 ## Installer
 
-The next packaging step is an installer, likely Inno Setup, that installs the `dist\PingerApp` folder, creates a Start Menu shortcut, and includes `THIRD_PARTY_NOTICES.md`.
+PingerApp has an Inno Setup script at:
+
+```text
+installer\PingerApp.iss
+```
+
+To build the installer after creating the PyInstaller output:
+
+```powershell
+.\scripts\build_installer.ps1
+```
+
+To rebuild the PyInstaller output and then build the installer:
+
+```powershell
+.\scripts\build_installer.ps1 -BuildApp
+```
+
+The script looks for `ISCC.exe` on `PATH` and in the default Inno Setup 6 install locations. If Inno Setup is installed somewhere else, pass the compiler path:
+
+```powershell
+.\scripts\build_installer.ps1 -InnoSetupCompiler "C:\Path\To\ISCC.exe"
+```
+
+The installer output is written to:
+
+```text
+installer_output\PingerAppSetup-0.1.0.exe
+```
+
+The installer copies the full `dist\PingerApp` folder, adds a Start Menu shortcut, offers an optional desktop shortcut, and copies `README.md` plus `THIRD_PARTY_NOTICES.md` to the install root.
+
+## Clean PC Test
+
+Before calling the installer complete, test it on a Windows PC or VM that does not have the development environment installed. Check:
+
+- app installs and launches from the Start Menu
+- Help and Report open
+- Speed Test finds bundled LibreSpeed CLI
+- Speed Targets can refresh LibreSpeed targets
+- LAN Throughput finds bundled iperf3
+- Adapter Info opens and reports adapter data
+- uninstall removes the app folder and shortcuts

@@ -55,6 +55,7 @@
 - Updated Speed Targets so selected table rows are compared, with the top fallback count used only when no rows are selected.
 - Added a PyInstaller spec, Windows build script, packaging notes, and development dependency file for packaged builds.
 - Verified the local PyInstaller one-folder build starts and includes bundled LibreSpeed, iperf3, and third-party notices.
+- Added an Inno Setup installer script, installer build wrapper, installer output ignore rule, and clean-PC installer test notes.
 
 ## 2026-05-07
 

@@ -13,6 +13,7 @@ PingerApp/env/
 
 build/
 dist/
+installer_output/
 *.spec
 !PingerApp.spec
 

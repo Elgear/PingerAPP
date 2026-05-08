@@ -73,7 +73,14 @@ pip install -r requirements-dev.txt
 
 The build output is written to `dist\PingerApp\PingerApp.exe`. Full packaging notes are in `PACKAGING.md`.
 
-For a PC install, wrap the PyInstaller output with an installer such as Inno Setup. The installer should include:
+For a PC install, build the PyInstaller output and then run the Inno Setup wrapper:
+
+```powershell
+.\scripts\build_windows.ps1 -Clean
+.\scripts\build_installer.ps1
+```
+
+The installer script is `installer\PingerApp.iss`, and the generated setup executable is written to `installer_output\PingerAppSetup-0.1.0.exe`. The installer includes:
 
 - the PingerApp executable and Python runtime bundle,
 - required Python libraries,
@@ -82,4 +89,5 @@ For a PC install, wrap the PyInstaller output with an installer such as Inno Set
 - bundled `tools/iperf3/iperf3.exe` and `tools/iperf3/cygwin1.dll`,
 - iperf3, Windows build, and Cygwin license attribution,
 - a Start Menu shortcut,
+- an optional desktop shortcut,
 - a note that ICMP ping may require elevated permissions depending on the machine.
