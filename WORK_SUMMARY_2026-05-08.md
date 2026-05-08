@@ -55,6 +55,7 @@
 - Bundled iperf3 3.21 for Windows x64 with Cygwin runtime DLL, checksums, source records, and license notices.
 - Improved LAN Throughput guidance and iperf3 connection errors so users enter another PC running iperf3 instead of assuming the gateway/router is a valid server.
 - Added a Gateway Stability tool for repeated first-hop ping monitoring with latency, packet loss, jitter, spike counts, raw ping log, diagnosis, Help, and Report support.
+- Added a Loaded Latency bufferbloat tool that compares idle ping latency with latency while LibreSpeed load is running, with loss/jitter, diagnosis, Help, and Report support.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
@@ -73,6 +74,7 @@
 - Adapter Info opens from the Tools launcher and helps identify local 100 Mbps link negotiation before blaming ISP speed.
 - LAN Throughput opens from the Tools launcher and uses bundled `tools/iperf3/iperf3.exe`, with `iperf3` on PATH as a fallback.
 - Gateway Stability opens from the Tools launcher and defaults to the detected gateway when available.
+- Loaded Latency opens from the Tools launcher and uses bundled LibreSpeed plus ping sampling to estimate bufferbloat.
 
 ## Verification Used
 

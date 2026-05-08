@@ -1389,6 +1389,219 @@ class GatewayStabilityWorker(QThread):
         return None, raw or "No ping output"
 
 
+class LoadedLatencyWorker(QThread):
+    """Measures baseline latency, then latency while LibreSpeed load runs."""
+    phase_ready = pyqtSignal(str)
+    sample_ready = pyqtSignal(dict)
+    result_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, executable: str, ping_target: str, baseline_count=10, load_duration=15, interval_ms=1000, timeout_ms=1000):
+        super().__init__()
+        self.executable = executable
+        self.ping_target = ping_target
+        self.baseline_count = baseline_count
+        self.load_duration = load_duration
+        self.interval_ms = interval_ms
+        self.timeout_ms = timeout_ms
+        self._stop_requested = False
+        self._load_process = None
+
+    def stop(self):
+        self._stop_requested = True
+        proc = self._load_process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+    def run(self):
+        self.phase_ready.emit("Collecting idle latency baseline...")
+        idle_samples = self._collect_ping_samples("idle", count=self.baseline_count)
+        if self._stop_requested:
+            return
+
+        self.phase_ready.emit("Running LibreSpeed load and measuring loaded latency...")
+        loaded_samples, speed_data, speed_error = self._run_loaded_phase()
+        if self._stop_requested:
+            return
+
+        if speed_error:
+            self.error_ready.emit(speed_error)
+            return
+
+        result = self._build_result(idle_samples, loaded_samples, speed_data)
+        self.result_ready.emit(result)
+
+    def _run_loaded_phase(self):
+        cmd = [
+            self.executable,
+            "--json",
+            "--no-icmp",
+            "--duration", str(self.load_duration),
+            "--telemetry-level", "disabled",
+        ]
+        try:
+            kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            self._load_process = subprocess.Popen(cmd, **kwargs)
+        except FileNotFoundError:
+            return [], None, "LibreSpeed CLI executable was not found."
+        except OSError as e:
+            return [], None, f"Could not run LibreSpeed CLI: {e}"
+
+        samples = []
+        started = time.monotonic()
+        max_seconds = max(60, int(self.load_duration) + 90)
+        while not self._stop_requested and self._load_process.poll() is None:
+            if time.monotonic() - started > max_seconds:
+                self._load_process.terminate()
+                return samples, None, f"LibreSpeed load timed out after {max_seconds} seconds."
+            latency, raw = self._ping_once()
+            samples.append(latency)
+            self.sample_ready.emit({
+                "phase": "loaded",
+                "index": len(samples),
+                "latency": latency,
+                "raw": raw,
+                "status": "Timeout" if latency is None else f"{latency:.1f} ms",
+            })
+            self.msleep(max(0, int(self.interval_ms)))
+
+        if self._stop_requested:
+            return samples, None, None
+
+        try:
+            stdout, stderr = self._load_process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._load_process.kill()
+            stdout, stderr = self._load_process.communicate(timeout=5)
+
+        if self._load_process.returncode != 0:
+            message = (stderr or stdout or "LibreSpeed CLI failed during loaded latency test.").strip()
+            return samples, None, message
+
+        output = (stdout or "").strip()
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            start = output.find("{")
+            end = output.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                return samples, None, "LibreSpeed CLI did not return JSON output."
+            try:
+                parsed = json.loads(output[start:end+1])
+            except json.JSONDecodeError:
+                return samples, None, "Could not parse LibreSpeed JSON output."
+
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else {}
+        if not isinstance(parsed, dict):
+            return samples, None, "LibreSpeed CLI returned an unsupported JSON shape."
+        return samples, parsed, None
+
+    def _collect_ping_samples(self, phase: str, count: int):
+        samples = []
+        for index in range(1, count + 1):
+            if self._stop_requested:
+                break
+            latency, raw = self._ping_once()
+            samples.append(latency)
+            self.sample_ready.emit({
+                "phase": phase,
+                "index": index,
+                "latency": latency,
+                "raw": raw,
+                "status": "Timeout" if latency is None else f"{latency:.1f} ms",
+            })
+            if index < count and not self._stop_requested:
+                self.msleep(max(0, int(self.interval_ms)))
+        return samples
+
+    def _ping_once(self):
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(self.timeout_ms), self.ping_target]
+        else:
+            timeout_seconds = max(1, int(math.ceil(self.timeout_ms / 1000)))
+            cmd = ["ping", "-c", "1", "-W", str(timeout_seconds), self.ping_target]
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": max(2, int(math.ceil(self.timeout_ms / 1000)) + 2),
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except Exception as e:
+            return None, f"Ping failed: {e}"
+
+        raw = (completed.stdout or completed.stderr or "").strip()
+        match = re.search(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms", raw, re.IGNORECASE)
+        if not match:
+            match = re.search(r"time\s+(\d+(?:\.\d+)?)\s*ms", raw, re.IGNORECASE)
+        if match and completed.returncode == 0:
+            return float(match.group(1)), raw
+        return None, raw or "No ping output"
+
+    def _sample_stats(self, samples):
+        valid = [value for value in samples if value is not None]
+        jitters = [abs(valid[index] - valid[index - 1]) for index in range(1, len(valid))]
+        return {
+            "sent": len(samples),
+            "received": len(valid),
+            "lost": len(samples) - len(valid),
+            "loss_pct": 0.0 if not samples else ((len(samples) - len(valid)) / len(samples)) * 100,
+            "avg_ms": None if not valid else sum(valid) / len(valid),
+            "max_ms": None if not valid else max(valid),
+            "jitter_ms": None if not jitters else sum(jitters) / len(jitters),
+        }
+
+    def _build_result(self, idle_samples, loaded_samples, speed_data):
+        idle = self._sample_stats(idle_samples)
+        loaded = self._sample_stats(loaded_samples)
+        delta = None
+        if idle["avg_ms"] is not None and loaded["avg_ms"] is not None:
+            delta = loaded["avg_ms"] - idle["avg_ms"]
+
+        result = {
+            "target": self.ping_target,
+            "idle": idle,
+            "loaded": loaded,
+            "increase_ms": delta,
+            "download": format_bits_per_second((speed_data or {}).get("download")),
+            "upload": format_bits_per_second((speed_data or {}).get("upload")),
+            "speed_raw": json.dumps(speed_data or {}, indent=2),
+        }
+        result["diagnosis"] = self._diagnosis(result)
+        return result
+
+    def _diagnosis(self, result):
+        loaded = result["loaded"]
+        delta = result.get("increase_ms")
+        if loaded["loss_pct"] > 0:
+            return (
+                f"Loaded packet loss is {loaded['loss_pct']:.1f}%. Loss while the line is busy can indicate Wi-Fi instability, "
+                "router queue pressure, ISP congestion, or a saturated local link."
+            )
+        if delta is None:
+            return "Not enough successful ping replies to compare idle and loaded latency."
+        if delta <= 20:
+            return f"Loaded latency increased by {delta:.1f} ms. This looks healthy for most connections."
+        if delta <= 75:
+            return (
+                f"Loaded latency increased by {delta:.1f} ms. This is noticeable queueing under load. "
+                "QoS/SQM on the router may improve responsiveness."
+            )
+        return (
+            f"Loaded latency increased by {delta:.1f} ms. This is likely bufferbloat or heavy queueing under load. "
+            "Check router SQM/QoS, Wi-Fi quality, and whether upload/download bandwidth is saturating."
+        )
+
+
 class SpeedTestServerListWorker(QThread):
     """Fetches the LibreSpeed public server list in the background."""
     servers_ready = pyqtSignal(list)
@@ -1564,6 +1777,7 @@ class PingerApp(QWidget):
         self.lan_throughput_worker = None
         self.lan_server_process = None
         self.gateway_stability_worker = None
+        self.loaded_latency_worker = None
         self.http_test_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
@@ -1952,6 +2166,23 @@ class PingerApp(QWidget):
         self.gateway_stability_btn.setFixedSize(135, 30)
         self.gateway_stability_btn.setToolTip("Monitor default gateway latency, loss, jitter, and spikes")
         self.gateway_stability_btn.clicked.connect(self.show_gateway_stability_window)
+        self.loaded_window = None
+        self.loaded_target_input = None
+        self.loaded_baseline_spin = None
+        self.loaded_duration_spin = None
+        self.loaded_interval_spin = None
+        self.loaded_timeout_spin = None
+        self.loaded_start_btn = None
+        self.loaded_stop_btn = None
+        self.loaded_status_label = None
+        self.loaded_result_labels = {}
+        self.loaded_diagnosis_box = None
+        self.loaded_raw_box = None
+        self.loaded_last_result = None
+        self.loaded_latency_btn = QPushButton("Loaded Latency")
+        self.loaded_latency_btn.setFixedSize(135, 30)
+        self.loaded_latency_btn.setToolTip("Measure bufferbloat by pinging during a speed test")
+        self.loaded_latency_btn.clicked.connect(self.show_loaded_latency_window)
         self.report_window = None
         self.report_checkboxes = {}
         self.report_preview_box = None
@@ -2207,6 +2438,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.adapter_info_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.lan_throughput_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.gateway_stability_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.loaded_latency_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
@@ -3626,6 +3858,247 @@ class PingerApp(QWidget):
         else:
             self._set_gateway_status("Gateway stability monitor stopped.", "info")
 
+    def show_loaded_latency_window(self):
+        """Open the bufferbloat / loaded latency diagnostic window."""
+        if self.loaded_window is None:
+            self.loaded_window = QWidget(None, Qt.Window)
+            self.loaded_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.loaded_window.setWindowTitle("Loaded Latency")
+            self.loaded_window.setMinimumSize(820, 650)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Test")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.loaded_target_input = QLineEdit("1.1.1.1")
+            self.loaded_target_input.setPlaceholderText("Ping target during test")
+            self.loaded_target_input.setMinimumWidth(260)
+            self.loaded_baseline_spin = QSpinBox()
+            self.loaded_baseline_spin.setRange(3, 100)
+            self.loaded_baseline_spin.setValue(10)
+            self.loaded_duration_spin = QSpinBox()
+            self.loaded_duration_spin.setRange(5, 60)
+            self.loaded_duration_spin.setValue(15)
+            self.loaded_duration_spin.setSuffix(" sec")
+            self.loaded_interval_spin = QSpinBox()
+            self.loaded_interval_spin.setRange(250, 5000)
+            self.loaded_interval_spin.setSingleStep(250)
+            self.loaded_interval_spin.setValue(1000)
+            self.loaded_interval_spin.setSuffix(" ms")
+            self.loaded_timeout_spin = QSpinBox()
+            self.loaded_timeout_spin.setRange(250, 10000)
+            self.loaded_timeout_spin.setSingleStep(250)
+            self.loaded_timeout_spin.setValue(1000)
+            self.loaded_timeout_spin.setSuffix(" ms")
+            self.loaded_start_btn = QPushButton("Run Loaded Latency")
+            self.loaded_start_btn.clicked.connect(self.start_loaded_latency_test)
+            self.loaded_stop_btn = QPushButton("Stop")
+            self.loaded_stop_btn.setEnabled(False)
+            self.loaded_stop_btn.clicked.connect(self.stop_loaded_latency_test)
+
+            controls.addWidget(QLabel("Ping Target"), 0, 0)
+            controls.addWidget(self.loaded_target_input, 0, 1, 1, 5)
+            controls.addWidget(QLabel("Baseline samples"), 1, 0)
+            controls.addWidget(self.loaded_baseline_spin, 1, 1)
+            controls.addWidget(QLabel("Load duration"), 1, 2)
+            controls.addWidget(self.loaded_duration_spin, 1, 3)
+            controls.addWidget(QLabel("Ping interval"), 1, 4)
+            controls.addWidget(self.loaded_interval_spin, 1, 5)
+            controls.addWidget(QLabel("Ping timeout"), 2, 0)
+            controls.addWidget(self.loaded_timeout_spin, 2, 1)
+            controls.addWidget(self.loaded_start_btn, 2, 4)
+            controls.addWidget(self.loaded_stop_btn, 2, 5)
+            controls.setColumnStretch(1, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.loaded_status_label = QLabel("Ready")
+            self.loaded_status_label.setAlignment(Qt.AlignCenter)
+            self.loaded_status_label.setWordWrap(True)
+            self.loaded_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.loaded_status_label)
+
+            results_group = QGroupBox("Results")
+            results = QGridLayout()
+            results.setHorizontalSpacing(12)
+            results.setVerticalSpacing(8)
+            fields = [
+                ("idle_avg", "Idle Avg"),
+                ("loaded_avg", "Loaded Avg"),
+                ("increase", "Increase"),
+                ("loaded_max", "Loaded Max"),
+                ("loaded_jitter", "Loaded Jitter"),
+                ("loaded_loss", "Loaded Loss"),
+                ("download", "Download"),
+                ("upload", "Upload"),
+            ]
+            self.loaded_result_labels = {}
+            for row, (key, label_text) in enumerate(fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.loaded_result_labels[key] = value
+                results.addWidget(name, row // 2, (row % 2) * 2)
+                results.addWidget(value, row // 2, (row % 2) * 2 + 1)
+            results.setColumnStretch(1, 1)
+            results.setColumnStretch(3, 1)
+            results_group.setLayout(results)
+            layout.addWidget(results_group)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.loaded_diagnosis_box = QTextEdit()
+            self.loaded_diagnosis_box.setReadOnly(True)
+            self.loaded_diagnosis_box.setMinimumHeight(90)
+            self.loaded_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.loaded_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group)
+
+            raw_group = QGroupBox("Ping Log / Speed Test JSON")
+            raw_layout = QVBoxLayout()
+            self.loaded_raw_box = QTextEdit()
+            self.loaded_raw_box.setReadOnly(True)
+            self.loaded_raw_box.setMinimumHeight(170)
+            self.loaded_raw_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            raw_layout.addWidget(self.loaded_raw_box)
+            raw_group.setLayout(raw_layout)
+            layout.addWidget(raw_group, 1)
+
+            self.loaded_window.setLayout(layout)
+
+        self.loaded_window.show()
+        self.loaded_window.raise_()
+        self.loaded_window.activateWindow()
+
+    def _set_loaded_status(self, message: str, level="info"):
+        if self.loaded_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.loaded_status_label.setText(message)
+        self.loaded_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+    def start_loaded_latency_test(self):
+        if self.loaded_latency_worker is not None and self.loaded_latency_worker.isRunning():
+            return
+        executable = self._find_speedtest_executable()
+        if not executable:
+            self._set_loaded_status(
+                "LibreSpeed CLI not found. Put librespeed-cli.exe in tools/librespeed or install librespeed-cli on PATH.",
+                "error",
+            )
+            return
+        target = self.loaded_target_input.text().strip() if self.loaded_target_input is not None else ""
+        if not target:
+            QMessageBox.warning(self, "Loaded Latency Error", "Enter a ping target.")
+            return
+
+        for label in self.loaded_result_labels.values():
+            label.setText("N/A")
+        if self.loaded_diagnosis_box is not None:
+            self.loaded_diagnosis_box.clear()
+        if self.loaded_raw_box is not None:
+            self.loaded_raw_box.clear()
+        self.loaded_last_result = None
+        self.loaded_start_btn.setEnabled(False)
+        self.loaded_stop_btn.setEnabled(True)
+        self._set_loaded_status("Starting loaded latency test...", "running")
+
+        self.loaded_latency_worker = LoadedLatencyWorker(
+            executable,
+            target,
+            baseline_count=self.loaded_baseline_spin.value(),
+            load_duration=self.loaded_duration_spin.value(),
+            interval_ms=self.loaded_interval_spin.value(),
+            timeout_ms=self.loaded_timeout_spin.value(),
+        )
+        self.loaded_latency_worker.phase_ready.connect(lambda message: self._set_loaded_status(message, "running"))
+        self.loaded_latency_worker.sample_ready.connect(self._add_loaded_latency_sample)
+        self.loaded_latency_worker.result_ready.connect(self._set_loaded_latency_result)
+        self.loaded_latency_worker.error_ready.connect(self._set_loaded_latency_error)
+        self.loaded_latency_worker.finished.connect(self._finish_loaded_latency_test)
+        self.loaded_latency_worker.finished.connect(self.loaded_latency_worker.deleteLater)
+        self.loaded_latency_worker.finished.connect(lambda: setattr(self, "loaded_latency_worker", None))
+        self.loaded_latency_worker.start()
+
+    def stop_loaded_latency_test(self):
+        if self.loaded_latency_worker is not None and self.loaded_latency_worker.isRunning():
+            self.loaded_latency_worker.stop()
+            self._set_loaded_status("Stopping loaded latency test...", "running")
+
+    def _add_loaded_latency_sample(self, sample: dict):
+        if self.loaded_raw_box is None:
+            return
+        self.loaded_raw_box.append(
+            f"{sample.get('phase', '').title()} sample {sample.get('index')}: {sample.get('status')}"
+        )
+
+    def _set_loaded_latency_result(self, result: dict):
+        self.loaded_last_result = result
+        idle = result.get("idle", {})
+        loaded = result.get("loaded", {})
+        increase = result.get("increase_ms")
+        values = {
+            "idle_avg": "N/A" if idle.get("avg_ms") is None else f"{idle.get('avg_ms'):.1f} ms",
+            "loaded_avg": "N/A" if loaded.get("avg_ms") is None else f"{loaded.get('avg_ms'):.1f} ms",
+            "increase": "N/A" if increase is None else f"+{increase:.1f} ms",
+            "loaded_max": "N/A" if loaded.get("max_ms") is None else f"{loaded.get('max_ms'):.1f} ms",
+            "loaded_jitter": "N/A" if loaded.get("jitter_ms") is None else f"{loaded.get('jitter_ms'):.1f} ms",
+            "loaded_loss": f"{loaded.get('loss_pct', 0):.1f}%",
+            "download": result.get("download", "N/A"),
+            "upload": result.get("upload", "N/A"),
+        }
+        for key, value in values.items():
+            if key in self.loaded_result_labels:
+                self.loaded_result_labels[key].setText(value)
+        if self.loaded_diagnosis_box is not None:
+            self.loaded_diagnosis_box.setPlainText(result.get("diagnosis", "N/A"))
+        if self.loaded_raw_box is not None:
+            self.loaded_raw_box.append("")
+            self.loaded_raw_box.append("LibreSpeed JSON:")
+            self.loaded_raw_box.append(result.get("speed_raw", ""))
+        level = "ok" if loaded.get("loss_pct", 0) == 0 and (increase is None or increase <= 75) else "error"
+        self._set_loaded_status("Loaded latency test completed.", level)
+
+    def _set_loaded_latency_error(self, message: str):
+        self._set_loaded_status(f"Loaded latency failed: {message}", "error")
+        if self.loaded_diagnosis_box is not None:
+            self.loaded_diagnosis_box.setPlainText(
+                "Check that LibreSpeed CLI is available, the internet connection is reachable, and the ping target responds."
+            )
+
+    def _finish_loaded_latency_test(self):
+        if self.loaded_start_btn is not None:
+            self.loaded_start_btn.setEnabled(True)
+        if self.loaded_stop_btn is not None:
+            self.loaded_stop_btn.setEnabled(False)
+        if self.loaded_last_result is None and self.loaded_status_label is not None:
+            current = self.loaded_status_label.text()
+            if current.startswith("Stopping"):
+                self._set_loaded_status("Loaded latency test stopped.", "info")
+
     def show_http_test_window(self):
         """Open the HTTP/HTTPS diagnostic window."""
         if self.http_window is None:
@@ -4351,6 +4824,15 @@ class PingerApp(QWidget):
             <li>If the gateway stays stable while internet speed is poor, the problem is more likely beyond the local LAN, such as router WAN, ISP, route, or remote server.</li>
         </ul>
 
+        <h3>Loaded Latency</h3>
+        <ul>
+            <li>Measures idle latency first, then runs a LibreSpeed test while continuing to ping a target such as <code>1.1.1.1</code>.</li>
+            <li><b>Increase</b> is loaded average latency minus idle average latency. This is the main bufferbloat signal.</li>
+            <li>A small increase is healthy. A large increase means traffic queues are building while the line is busy.</li>
+            <li>Loaded packet loss can point to Wi-Fi instability, local saturation, router queue pressure, or ISP congestion.</li>
+            <li>Use this when calls, games, or remote desktop get laggy while downloads, uploads, cloud sync, or speed tests are running.</li>
+        </ul>
+
         <h3>Speed Test</h3>
         <ul>
             <li>Uses LibreSpeed CLI to measure download, upload, latency, and jitter.</li>
@@ -4415,7 +4897,7 @@ class PingerApp(QWidget):
         <h3>Report</h3>
         <ul>
             <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
-            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
+            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
             <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
             <li><b>Save as TXT</b> writes the current report to a text file.</li>
         </ul>
@@ -4450,6 +4932,7 @@ class PingerApp(QWidget):
                 ("ping_stats", "Ping stats"),
                 ("lan_throughput", "LAN Throughput"),
                 ("gateway_stability", "Gateway Stability"),
+                ("loaded_latency", "Loaded Latency"),
                 ("speedtest_history", "Speed Test history"),
                 ("dns_lookup", "Last DNS lookup"),
                 ("traceroute", "Last traceroute"),
@@ -4541,6 +5024,7 @@ class PingerApp(QWidget):
             ("ping_stats", "Ping Stats", self._report_ping_stats_lines),
             ("lan_throughput", "LAN Throughput", self._report_lan_throughput_lines),
             ("gateway_stability", "Gateway Stability", self._report_gateway_stability_lines),
+            ("loaded_latency", "Loaded Latency", self._report_loaded_latency_lines),
             ("speedtest_history", "Speed Test History", self._report_speedtest_history_lines),
             ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
             ("traceroute", "Last Traceroute", self._report_traceroute_lines),
@@ -4677,6 +5161,31 @@ class PingerApp(QWidget):
             "",
             "Diagnosis:",
             stats.get("diagnosis", "N/A"),
+        ]
+
+    def _report_loaded_latency_lines(self):
+        if not self.loaded_last_result:
+            return ["No Loaded Latency result available."]
+        result = self.loaded_last_result
+        idle = result.get("idle", {})
+        loaded = result.get("loaded", {})
+        increase = result.get("increase_ms")
+        def ms_value(data, key):
+            value = data.get(key)
+            return "N/A" if value is None else f"{value:.1f} ms"
+        return [
+            f"Ping Target: {result.get('target', 'N/A')}",
+            f"Idle Avg: {ms_value(idle, 'avg_ms')}",
+            f"Loaded Avg: {ms_value(loaded, 'avg_ms')}",
+            f"Increase: {'N/A' if increase is None else f'+{increase:.1f} ms'}",
+            f"Loaded Max: {ms_value(loaded, 'max_ms')}",
+            f"Loaded Jitter: {ms_value(loaded, 'jitter_ms')}",
+            f"Loaded Loss: {loaded.get('loss_pct', 0):.1f}%",
+            f"Download: {result.get('download', 'N/A')}",
+            f"Upload: {result.get('upload', 'N/A')}",
+            "",
+            "Diagnosis:",
+            result.get("diagnosis", "N/A"),
         ]
 
     def _report_speedtest_history_lines(self):
@@ -5895,6 +6404,8 @@ class PingerApp(QWidget):
     def closeEvent(self, event):
         self.timer.stop()
         self.elapsed_timer.stop()
+        if self.loaded_latency_worker is not None and self.loaded_latency_worker.isRunning():
+            self.loaded_latency_worker.stop()
         if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
             self.gateway_stability_worker.stop()
         self.stop_lan_server()
