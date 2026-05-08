@@ -24,6 +24,7 @@
 - Added LibreSpeed server refresh/selection, configurable duration, optional share URL generation, test timestamp, data used, and server URL display.
 - Removed the LibreSpeed packet-loss row, added Speed Test run history, and added a duration-based running progress bar.
 - Auto-loaded the LibreSpeed server list on Speed Test open and added clearer handling for selected servers that return no result.
+- Added public ISP lookup, hostname, and primary MAC address to Host Info, and reused the ISP lookup in Speed Test results when LibreSpeed omits ISP data.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 

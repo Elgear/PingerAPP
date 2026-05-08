@@ -13,6 +13,7 @@ import math
 import json
 import os
 import shutil
+import uuid
 
 from collections import deque
 from datetime import datetime
@@ -44,6 +45,43 @@ def get_public_ip(timeout=2):
             return r.read().decode()
     except:
         return "N/A"
+
+def get_public_ip_info(timeout=3):
+    """Return public IP metadata for ISP/ASN display."""
+    try:
+        with urllib.request.urlopen("https://ipwho.is/", timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return {
+            "ip": "N/A",
+            "isp": "N/A",
+            "asn": "N/A",
+            "location": "N/A",
+            "source": "ipwho.is",
+        }
+
+    connection = data.get("connection", {}) or {}
+    parts = [data.get("city"), data.get("region"), data.get("country")]
+    return {
+        "ip": data.get("ip") or "N/A",
+        "isp": connection.get("isp") or connection.get("org") or "N/A",
+        "asn": connection.get("asn") or "N/A",
+        "location": ", ".join(part for part in parts if part) or "N/A",
+        "source": "ipwho.is",
+    }
+
+def get_primary_mac():
+    """Return the host MAC address formatted for display."""
+    value = uuid.getnode()
+    if (value >> 40) % 2:
+        return "N/A"
+    return ":".join(f"{(value >> shift) & 0xff:02X}" for shift in range(40, -1, -8))
+
+def first_available(*values):
+    for value in values:
+        if value not in (None, "", "N/A"):
+            return value
+    return "N/A"
 
 def get_default_gateway():
     """Return LAN gateway by parsing system route tables."""
@@ -98,10 +136,21 @@ class TracerouteWorker(QThread):
 # §3 ─────────────────────────────────────────────────────────────────────────────
 class HostInfoWorker(QThread):
     """Fetches local network details without blocking the UI thread."""
-    info_ready = pyqtSignal(str, str, str)
+    info_ready = pyqtSignal(dict)
 
     def run(self):
-        self.info_ready.emit(get_local_ip(), get_default_gateway(), get_public_ip())
+        public_info = get_public_ip_info()
+        self.info_ready.emit({
+            "hostname": socket.gethostname(),
+            "local_ip": get_local_ip(),
+            "gateway": get_default_gateway(),
+            "public_ip": first_available(public_info.get("ip"), get_public_ip()),
+            "isp": first_available(public_info.get("isp")),
+            "asn": first_available(public_info.get("asn")),
+            "location": first_available(public_info.get("location")),
+            "mac": get_primary_mac(),
+            "source": first_available(public_info.get("source")),
+        })
 
 
 class DnsLookupWorker(QThread):
@@ -559,9 +608,12 @@ class PingerApp(QWidget):
         self.speedtest_btn.clicked.connect(self.show_speedtest_window)
 
         # §3.A.k Host-info fields
+        self.hostname_label  = QLabel("Loading...")
         self.host_ip_label   = QLabel("Loading...")
         self.gateway_label   = QLabel("Loading...")
         self.public_ip_label = QLabel("Loading...")
+        self.public_isp_label = QLabel("Loading...")
+        self.host_mac_label = QLabel("Loading...")
 
         # §3.A.l Counters & labels
         self.lat_count_label   = QLabel("0")
@@ -749,15 +801,22 @@ class PingerApp(QWidget):
         # §3.B.f Host-Info panel
         host_info_group = QGroupBox("Host Info")
         host_info_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        host_info_group.setMinimumSize(190,120)
+        host_info_group.setMinimumSize(260,120)
         hi = QGridLayout(); hi.setContentsMargins(8,8,8,8)
-        hi.setHorizontalSpacing(8); hi.setVerticalSpacing(6)
-        hi.addWidget(QLabel("Local Host IP:"),     0,0)
-        hi.addWidget(self.host_ip_label,           0,1)
-        hi.addWidget(QLabel("1st Hop/Gateway:"),   1,0)
-        hi.addWidget(self.gateway_label,           1,1)
-        hi.addWidget(QLabel("Public IP:"),         2,0)
-        hi.addWidget(self.public_ip_label,         2,1)
+        hi.setHorizontalSpacing(8); hi.setVerticalSpacing(4)
+        host_info_rows = [
+            ("Host:", self.hostname_label),
+            ("Local IP:", self.host_ip_label),
+            ("Gateway:", self.gateway_label),
+            ("Public IP:", self.public_ip_label),
+            ("ISP:", self.public_isp_label),
+            ("MAC:", self.host_mac_label),
+        ]
+        for row, (label_text, value_label) in enumerate(host_info_rows):
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value_label.setWordWrap(False)
+            hi.addWidget(QLabel(label_text), row, 0)
+            hi.addWidget(value_label, row, 1)
         host_info_group.setLayout(hi)
 
         # combine panels
@@ -886,10 +945,29 @@ class PingerApp(QWidget):
         self.host_info_worker.finished.connect(lambda: setattr(self, "host_info_worker", None))
         self.host_info_worker.start()
 
-    def _set_host_info(self, local_ip: str, gateway: str, public_ip: str):
-        self.host_ip_label.setText(local_ip)
-        self.gateway_label.setText(gateway)
-        self.public_ip_label.setText(public_ip)
+    def _set_host_info(self, info: dict):
+        values = {
+            self.hostname_label: info.get("hostname", "N/A"),
+            self.host_ip_label: info.get("local_ip", "N/A"),
+            self.gateway_label: info.get("gateway", "N/A"),
+            self.public_ip_label: info.get("public_ip", "N/A"),
+            self.public_isp_label: info.get("isp", "N/A"),
+            self.host_mac_label: info.get("mac", "N/A"),
+        }
+        for label, value in values.items():
+            display = str(value or "N/A")
+            label.setText(display)
+            label.setToolTip(display)
+
+        details = []
+        if info.get("asn") not in (None, "", "N/A"):
+            details.append(f"ASN: {info['asn']}")
+        if info.get("location") not in (None, "", "N/A"):
+            details.append(f"Location: {info['location']}")
+        if info.get("source") not in (None, "", "N/A"):
+            details.append(f"Source: {info['source']}")
+        if details:
+            self.public_isp_label.setToolTip("\n".join([self.public_isp_label.text(), *details]))
 
     def _update_trace_target_label(self, host: str):
         target = host.strip() or "No target"
@@ -1276,6 +1354,14 @@ class PingerApp(QWidget):
                 return data[key]
         return None
 
+    def _host_info_isp(self):
+        if self.public_isp_label is None:
+            return None
+        value = self.public_isp_label.text().strip()
+        if value in ("", "Loading...", "N/A"):
+            return None
+        return value
+
     def _set_speedtest_result(self, data: dict):
         server = data.get("server", {}) or {}
         client = data.get("client", {}) or {}
@@ -1287,6 +1373,7 @@ class PingerApp(QWidget):
         isp = (
             self._dict_get_any(client, "isp", "ISP", "org", "Org")
             or self._dict_get_any(client, "ip", "IP")
+            or self._host_info_isp()
             or "N/A"
         )
 

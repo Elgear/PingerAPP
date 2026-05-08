@@ -13,6 +13,8 @@ python .\PingerApp\PingerApp.py
 
 Raw ICMP ping can require elevated network privileges on some systems. If the app cannot create a raw socket, it will now show an error when pinging starts instead of failing before the window opens.
 
+Host Info includes local hostname, local IP, first-hop gateway, public IP, public ISP, and primary MAC address. ISP metadata is looked up with a timeout-bound public IP metadata request and falls back to `N/A` if unavailable.
+
 ## LibreSpeed Speed Test
 
 The Speed Test window uses the bundled open-source LibreSpeed CLI at:
