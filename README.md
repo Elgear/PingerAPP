@@ -4,6 +4,22 @@ PyQt5 desktop tool for monitoring latency, packet loss, jitter, DNS lookups, and
 
 The Ping Panel supports saved Host presets so common gateways, public targets, and service IPs can be reused without retyping.
 
+## Download
+
+Windows builds are published from GitHub Releases:
+
+```text
+https://github.com/Grzybkins/PingerAPP/releases
+```
+
+For version `0.1.0`, download `PingerAppSetup-0.1.0.exe` and verify the checksum:
+
+```text
+SHA256 AEB4E2AA445462D2B1FC93906DD5321AFD40D8A458C84D4A8DFA33F2BFDD9564
+```
+
+The installer is currently unsigned, so Windows SmartScreen may show a warning.
+
 ## Setup
 
 ```powershell
@@ -38,6 +54,14 @@ The right-side Tools panel opens separate diagnostic windows:
 - Help: offline field guide explaining the main panels, controls, graph readings, tool workflows, report output, and common diagnostic meanings.
 
 MAC addresses can only be discovered when the target exposes them on the local network path. Routed hosts usually show no MAC address, or only the next-hop device in the local ARP cache.
+
+## Security And Privacy
+
+PingerApp is a local troubleshooting tool and does not require accounts, API keys, or secrets. Some diagnostics intentionally contact selected targets, public DNS resolvers, public IP metadata services, or public LibreSpeed servers when those tools are run.
+
+Only run Network Scanner against networks and hosts you own or are authorized to troubleshoot. Security reporting guidance is in `SECURITY.md`.
+
+No open-source project license has been selected yet. Add a `LICENSE` file before presenting the repository as open-source.
 
 ## LibreSpeed Speed Test
 

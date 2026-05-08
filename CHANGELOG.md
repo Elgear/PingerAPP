@@ -62,6 +62,7 @@
 - Updated the installer wrapper to find winget's per-user Inno Setup install location and moved the Inno architecture identifier to `x64compatible`.
 - Fixed the packaged app PyQt/SIP startup crash by moving packaging to a dedicated stable Python 3.13 environment.
 - Added a packaging environment setup script and rebuilt `installer_output\PingerAppSetup-0.1.0.exe` from the corrected PyInstaller output.
+- Added 0.1.0 release notes, installer checksum record, README download/security notes, and a security policy.
 
 ## 2026-05-07
 
