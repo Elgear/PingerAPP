@@ -388,6 +388,17 @@ class PortCheckWorker(QThread):
         self.detect_services = detect_services
         self.max_workers = max(1, min(int(max_workers), 256))
         self.discovery_ports = [80, 443, 22, 445, 3389]
+        self._stop_requested = False
+        self.was_stopped = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def _shutdown_executor(self, executor, wait):
+        try:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=wait)
 
     def _reverse_name(self, host):
         try:
@@ -483,34 +494,74 @@ class PortCheckWorker(QThread):
         live_targets = list(self.targets)
         if len(self.targets) > 1:
             live_targets = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.targets))) as executor:
-                futures = [executor.submit(self._discover_host, target, timeout_seconds) for target in self.targets]
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    completed += 1
-                    if result.get("alive"):
-                        live_targets.append(result["host"])
-                        self.host_ready.emit(result)
-                    self.progress_ready.emit(completed, total)
+            target_iter = iter(self.targets)
+            pending = set()
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.targets)))
+            try:
+                def submit_discovery():
+                    while not self._stop_requested and len(pending) < self.max_workers:
+                        try:
+                            target = next(target_iter)
+                        except StopIteration:
+                            break
+                        pending.add(executor.submit(self._discover_host, target, timeout_seconds))
+
+                submit_discovery()
+                while pending and not self._stop_requested:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        timeout=0.2,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        result = future.result()
+                        completed += 1
+                        if result.get("alive"):
+                            live_targets.append(result["host"])
+                            self.host_ready.emit(result)
+                        self.progress_ready.emit(completed, total)
+                    submit_discovery()
+            finally:
+                self.was_stopped = self._stop_requested
+                self._shutdown_executor(executor, wait=True)
+            if self._stop_requested:
+                return
             total = completed + (len(live_targets) * len(self.ports))
             self.progress_ready.emit(completed, total)
 
-        scan_jobs = [(target, port) for target in live_targets for port in self.ports]
-        if not scan_jobs:
+        if not live_targets:
             return
 
         single_hostname = self._reverse_name(live_targets[0]) if len(live_targets) == 1 else "N/A"
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(scan_jobs))) as executor:
-            futures = [
-                executor.submit(self._tcp_probe, target, port, timeout_seconds, self.detect_services)
-                for target, port in scan_jobs
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                result["hostname"] = single_hostname
-                self.result_ready.emit(result)
-                completed += 1
-                self.progress_ready.emit(completed, total)
+        job_iter = ((target, port) for target in live_targets for port in self.ports)
+        pending = set()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+        try:
+            def submit_scan_jobs():
+                while not self._stop_requested and len(pending) < self.max_workers:
+                    try:
+                        target, port = next(job_iter)
+                    except StopIteration:
+                        break
+                    pending.add(executor.submit(self._tcp_probe, target, port, timeout_seconds, self.detect_services))
+
+            submit_scan_jobs()
+            while pending and not self._stop_requested:
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=0.2,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    result = future.result()
+                    result["hostname"] = single_hostname
+                    self.result_ready.emit(result)
+                    completed += 1
+                    self.progress_ready.emit(completed, total)
+                submit_scan_jobs()
+        finally:
+            self.was_stopped = self._stop_requested
+            self._shutdown_executor(executor, wait=True)
 
 
 class StartResolveWorker(QThread):
@@ -741,15 +792,20 @@ class PingerApp(QWidget):
         self.port_window = None
         self.port_host_input = None
         self.port_ports_combo = None
-        self.port_scan_type_combo = None
+        self.port_target_mode_combo = None
+        self.port_subnet_combo = None
+        self.port_filter_combo = None
         self.port_timeout_spin = None
         self.port_concurrency_spin = None
         self.port_run_btn = None
+        self.port_stop_btn = None
         self.port_status_label = None
         self.port_table = None
         self.port_open_only_check = None
         self.port_service_probe_check = None
         self.port_progress_bar = None
+        self.port_help_label = None
+        self.port_scan_results = []
         self.port_scan_result_count = 0
         self.port_scan_open_count = 0
         self.port_scan_filtered_count = 0
@@ -1358,13 +1414,31 @@ class PingerApp(QWidget):
             controls.setHorizontalSpacing(8)
             controls.setVerticalSpacing(8)
             self.port_host_input = QLineEdit(self.host_input.text().strip())
-            self.port_host_input.setMinimumWidth(300)
-            self.port_scan_type_combo = QComboBox()
-            self.port_scan_type_combo.addItems([
-                "Auto target mode",
-                "Single host port scan",
-                "Network discovery + ports",
+            self.port_host_input.setMinimumWidth(260)
+            self.port_host_input.setPlaceholderText("Host, IP, or network base")
+            self.port_target_mode_combo = QComboBox()
+            self.port_target_mode_combo.addItems(["Single host", "Subnet"])
+            self.port_target_mode_combo.setToolTip("Single host scans exactly the target. Subnet scans the selected CIDR range around the entered IP.")
+            self.port_target_mode_combo.currentTextChanged.connect(self._update_port_target_controls)
+            self.port_subnet_combo = QComboBox()
+            self.port_subnet_combo.addItems([
+                "/32 single address",
+                "/31 point-to-point",
+                "/30 4 addresses",
+                "/29 8 addresses",
+                "/28 16 addresses",
+                "/27 32 addresses",
+                "/26 64 addresses",
+                "/25 128 addresses",
+                "/24 256 addresses",
+                "/23 512 addresses",
+                "/22 1024 addresses",
+                "/21 2048 addresses",
+                "/20 4096 addresses",
+                "/16 65536 addresses",
             ])
+            self.port_subnet_combo.setCurrentText("/24 256 addresses")
+            self.port_subnet_combo.setToolTip("Subnet size to combine with the Host/IP field when Target is Subnet.")
             self.port_ports_combo = QComboBox()
             self.port_ports_combo.setEditable(True)
             self.port_ports_combo.addItems([
@@ -1387,27 +1461,58 @@ class PingerApp(QWidget):
             self.port_concurrency_spin = QSpinBox()
             self.port_concurrency_spin.setRange(1, 256)
             self.port_concurrency_spin.setValue(64)
+            self.port_concurrency_spin.setToolTip("Parallel probes means how many TCP connection attempts can run at the same time. Lower is gentler; higher is faster.")
+            self.port_filter_combo = QComboBox()
+            self.port_filter_combo.addItems([
+                "All results",
+                "Open/live only",
+                "Open ports only",
+                "Filtered/dropped only",
+                "Closed/refused only",
+            ])
+            self.port_filter_combo.setToolTip("Filter what appears in the results table.")
+            self.port_filter_combo.currentTextChanged.connect(self._refresh_port_table)
             self.port_run_btn = QPushButton("Run Scan")
             self.port_run_btn.clicked.connect(self.start_port_check)
+            self.port_stop_btn = QPushButton("Stop")
+            self.port_stop_btn.setEnabled(False)
+            self.port_stop_btn.clicked.connect(self.stop_port_check)
             self.port_open_only_check = QCheckBox("Show open/live only")
+            self.port_open_only_check.setVisible(False)
             self.port_service_probe_check = QCheckBox("Probe service banners")
             self.port_service_probe_check.setToolTip("Best-effort banner, HTTP header, and TLS handshake checks on open ports.")
 
             controls.addWidget(QLabel("Host"), 0, 0)
             controls.addWidget(self.port_host_input, 0, 1)
-            controls.addWidget(QLabel("Mode"), 0, 2)
-            controls.addWidget(self.port_scan_type_combo, 0, 3)
+            controls.addWidget(QLabel("Target"), 0, 2)
+            controls.addWidget(self.port_target_mode_combo, 0, 3)
+            controls.addWidget(QLabel("Subnet"), 0, 4)
+            controls.addWidget(self.port_subnet_combo, 0, 5)
             controls.addWidget(QLabel("Port(s)"), 1, 0)
-            controls.addWidget(self.port_ports_combo, 1, 1, 1, 3)
+            controls.addWidget(self.port_ports_combo, 1, 1, 1, 5)
             controls.addWidget(QLabel("Timeout"), 2, 0)
             controls.addWidget(self.port_timeout_spin, 2, 1)
-            controls.addWidget(QLabel("Parallel"), 2, 2)
+            controls.addWidget(QLabel("Parallel probes"), 2, 2)
             controls.addWidget(self.port_concurrency_spin, 2, 3)
-            controls.addWidget(self.port_open_only_check, 3, 1)
-            controls.addWidget(self.port_service_probe_check, 3, 2)
-            controls.addWidget(self.port_run_btn, 3, 3)
+            controls.addWidget(QLabel("Filter"), 2, 4)
+            controls.addWidget(self.port_filter_combo, 2, 5)
+            controls.addWidget(self.port_service_probe_check, 3, 1, 1, 2)
+            controls.addWidget(self.port_run_btn, 3, 4)
+            controls.addWidget(self.port_stop_btn, 3, 5)
             controls.setColumnStretch(1, 1)
             layout.addLayout(controls)
+
+            self.port_help_label = QLabel(
+                "Single host scans one target. Subnet combines Host with the selected CIDR size. "
+                "Parallel probes are simultaneous connection attempts; lower is gentler, higher is faster."
+            )
+            self.port_help_label.setWordWrap(True)
+            self.port_help_label.setStyleSheet(
+                "QLabel { color: #3c4043; background: #f8f9fa; border: 1px solid #d5dce5; "
+                "border-radius: 4px; padding: 6px; }"
+            )
+            layout.addWidget(self.port_help_label)
+            self._update_port_target_controls()
 
             self.port_status_label = QLabel("Ready")
             self.port_status_label.setAlignment(Qt.AlignCenter)
@@ -1472,29 +1577,47 @@ class PingerApp(QWidget):
             raise ValueError("Enter at least one port.")
         return deduped
 
-    def _expand_scan_targets(self, target: str, mode: str):
+    def _update_port_target_controls(self):
+        if self.port_target_mode_combo is None or self.port_subnet_combo is None:
+            return
+        subnet_mode = self.port_target_mode_combo.currentText() == "Subnet"
+        self.port_subnet_combo.setEnabled(subnet_mode)
+
+    def _selected_subnet_prefix(self):
+        if self.port_subnet_combo is None:
+            return 24
+        match = re.search(r"/(\d+)", self.port_subnet_combo.currentText())
+        return int(match.group(1)) if match else 24
+
+    def _expand_scan_targets(self, target: str, mode: str, prefix=None):
         target = target.strip()
         if not target:
             raise ValueError("Enter a host, IP address, or CIDR range.")
 
-        should_parse_range = "/" in target or mode == "Network discovery + ports"
-        if should_parse_range:
+        if mode == "Subnet":
             try:
-                network = ipaddress.ip_network(target, strict=False)
+                if "/" in target:
+                    network = ipaddress.ip_network(target, strict=False)
+                else:
+                    network = ipaddress.ip_interface(f"{target}/{prefix or 24}").network
             except ValueError as e:
-                if mode == "Network discovery + ports":
-                    raise ValueError(f"Enter a valid CIDR range, for example 192.168.1.0/24. {e}")
-                return [target]
+                raise ValueError(f"Enter a valid IPv4 address or CIDR range, for example 192.168.1.10. {e}")
 
             if network.version != 4:
                 raise ValueError("Network discovery currently supports IPv4 ranges only.")
             if network.num_addresses > 512:
-                raise ValueError("Network discovery is limited to 512 addresses at a time.")
+                raise ValueError("Network discovery is limited to 512 addresses at a time. Use /23 or smaller.")
             hosts = list(network.hosts()) if network.prefixlen < 31 else list(network)
             if not hosts:
                 raise ValueError("The selected range has no usable hosts.")
             return [str(host) for host in hosts]
 
+        if "/" in target:
+            try:
+                interface = ipaddress.ip_interface(target)
+                return [str(interface.ip)]
+            except ValueError:
+                pass
         return [target]
 
     def start_port_check(self):
@@ -1512,9 +1635,9 @@ class PingerApp(QWidget):
             QMessageBox.warning(self, "Network Scanner Error", str(e))
             return
 
-        mode = self.port_scan_type_combo.currentText() if self.port_scan_type_combo is not None else "Auto target mode"
+        mode = self.port_target_mode_combo.currentText() if self.port_target_mode_combo is not None else "Single host"
         try:
-            targets = self._expand_scan_targets(host, mode)
+            targets = self._expand_scan_targets(host, mode, self._selected_subnet_prefix())
         except ValueError as e:
             QMessageBox.warning(self, "Network Scanner Error", str(e))
             return
@@ -1532,11 +1655,14 @@ class PingerApp(QWidget):
         max_workers = self.port_concurrency_spin.value() if self.port_concurrency_spin is not None else 64
         detect_services = self.port_service_probe_check is not None and self.port_service_probe_check.isChecked()
         self.port_table.setRowCount(0)
+        self.port_scan_results = []
         self.port_scan_result_count = 0
         self.port_scan_open_count = 0
         self.port_scan_filtered_count = 0
         self.port_scan_host_count = 0
         self.port_run_btn.setEnabled(False)
+        if self.port_stop_btn is not None:
+            self.port_stop_btn.setEnabled(True)
         if self.port_progress_bar is not None:
             self.port_progress_bar.setValue(0)
             self.port_progress_bar.setFormat("Scanning... 0%")
@@ -1565,6 +1691,19 @@ class PingerApp(QWidget):
         self.port_check_worker.finished.connect(lambda: setattr(self, "port_check_worker", None))
         self.port_check_worker.start()
 
+    def stop_port_check(self):
+        if self.port_check_worker is None or not self.port_check_worker.isRunning():
+            return
+        self.port_check_worker.request_stop()
+        if self.port_stop_btn is not None:
+            self.port_stop_btn.setEnabled(False)
+        if self.port_status_label is not None:
+            self.port_status_label.setText("Stopping scan after active probes finish...")
+            self.port_status_label.setStyleSheet(
+                "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+
     def _add_port_check_result(self, result: dict):
         if self.port_table is None:
             return
@@ -1583,6 +1722,34 @@ class PingerApp(QWidget):
             and status not in {"Open", "Host Up"}
         ):
             return
+        self.port_scan_results.append(result)
+        if not self._port_result_visible(result):
+            return
+        self._insert_port_result(result)
+
+    def _port_result_visible(self, result: dict):
+        status = result.get("status", "")
+        selected = self.port_filter_combo.currentText() if self.port_filter_combo is not None else "All results"
+        if selected == "Open/live only":
+            return status in {"Open", "Host Up"}
+        if selected == "Open ports only":
+            return status == "Open"
+        if selected == "Filtered/dropped only":
+            return status == "Filtered"
+        if selected == "Closed/refused only":
+            return status == "Closed"
+        return True
+
+    def _refresh_port_table(self, *args):
+        if self.port_table is None:
+            return
+        self.port_table.setRowCount(0)
+        for result in self.port_scan_results:
+            if self._port_result_visible(result):
+                self._insert_port_result(result)
+
+    def _insert_port_result(self, result: dict):
+        status = result.get("status", "")
         latency = "N/A" if result.get("latency") is None else f"{result['latency']:.1f} ms"
         row_values = [
             result.get("host", ""),
@@ -1596,17 +1763,19 @@ class PingerApp(QWidget):
         ]
         row = self.port_table.rowCount()
         self.port_table.insertRow(row)
+        row_background = None
+        if status == "Open":
+            row_background = QBrush(QColor("#dff3e6"))
+        elif status == "Host Up":
+            row_background = QBrush(QColor("#e8f0fe"))
+        elif status == "Filtered":
+            row_background = QBrush(QColor("#fff4ce"))
+        elif status in {"Closed", "No Response"}:
+            row_background = QBrush(QColor("#f8d7da"))
         for col, value in enumerate(row_values):
             item = QTableWidgetItem(value)
-            if col == 4:
-                if value == "Open":
-                    item.setBackground(QBrush(QColor("#e6f4ea")))
-                elif value == "Host Up":
-                    item.setBackground(QBrush(QColor("#e8f0fe")))
-                elif value == "Filtered":
-                    item.setBackground(QBrush(QColor("#fff4ce")))
-                elif value in {"Closed", "No Response"}:
-                    item.setBackground(QBrush(QColor("#fce8e6")))
+            if row_background is not None:
+                item.setBackground(row_background)
             self.port_table.setItem(row, col, item)
 
     def _update_port_scan_progress(self, completed: int, total: int):
@@ -1619,20 +1788,35 @@ class PingerApp(QWidget):
     def _finish_port_check(self):
         if self.port_run_btn is not None:
             self.port_run_btn.setEnabled(True)
+        if self.port_stop_btn is not None:
+            self.port_stop_btn.setEnabled(False)
+        stopped = self.port_check_worker is not None and getattr(self.port_check_worker, "was_stopped", False)
         if self.port_status_label is not None:
-            suffix = " (open/live-only view)" if self.port_open_only_check is not None and self.port_open_only_check.isChecked() else ""
+            suffix = ""
+            if self.port_filter_combo is not None and self.port_filter_combo.currentText() != "All results":
+                suffix = f" ({self.port_filter_combo.currentText()} view)"
+            prefix = "Stopped" if stopped else "Completed"
             self.port_status_label.setText(
-                f"Completed. {self.port_scan_host_count} host(s) found, "
+                f"{prefix}. {self.port_scan_host_count} host(s) found, "
                 f"{self.port_scan_open_count}/{self.port_scan_result_count} port(s) open, "
                 f"{self.port_scan_filtered_count} filtered/dropped{suffix}."
             )
-            self.port_status_label.setStyleSheet(
-                "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
-                "border-radius: 4px; padding: 8px; font-weight: bold; }"
-            )
+            if stopped:
+                self.port_status_label.setStyleSheet(
+                    "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                    "border-radius: 4px; padding: 8px; font-weight: bold; }"
+                )
+            else:
+                self.port_status_label.setStyleSheet(
+                    "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
+                    "border-radius: 4px; padding: 8px; font-weight: bold; }"
+                )
         if self.port_progress_bar is not None:
-            self.port_progress_bar.setValue(100)
-            self.port_progress_bar.setFormat("Complete")
+            if stopped:
+                self.port_progress_bar.setFormat("Stopped")
+            else:
+                self.port_progress_bar.setValue(100)
+                self.port_progress_bar.setFormat("Complete")
 
     def show_dns_window(self):
         """Open the DNS / WHOIS diagnostic window."""
