@@ -43,6 +43,7 @@
 - Added LAN Throughput to the Report tool, Help documentation, README, and packaging notes.
 - Bundled iperf3 3.21 for Windows x64 with Cygwin runtime DLL, checksums, source records, and license notices.
 - Improved LAN Throughput guidance and iperf3 connection errors so the gateway/router is not presented as the default test server.
+- Added a Gateway Stability tool for repeated first-hop ping monitoring with latency, packet loss, jitter, spike counts, raw ping log, diagnosis, Help, and Report support.
 
 ## 2026-05-07
 

@@ -54,6 +54,7 @@
 - Added LAN Throughput to the Report tool, Help documentation, README, and packaging notes.
 - Bundled iperf3 3.21 for Windows x64 with Cygwin runtime DLL, checksums, source records, and license notices.
 - Improved LAN Throughput guidance and iperf3 connection errors so users enter another PC running iperf3 instead of assuming the gateway/router is a valid server.
+- Added a Gateway Stability tool for repeated first-hop ping monitoring with latency, packet loss, jitter, spike counts, raw ping log, diagnosis, Help, and Report support.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
@@ -71,6 +72,7 @@
 - Help opens from the Tools launcher and provides built-in offline documentation.
 - Adapter Info opens from the Tools launcher and helps identify local 100 Mbps link negotiation before blaming ISP speed.
 - LAN Throughput opens from the Tools launcher and uses bundled `tools/iperf3/iperf3.exe`, with `iperf3` on PATH as a fallback.
+- Gateway Stability opens from the Tools launcher and defaults to the detected gateway when available.
 
 ## Verification Used
 

@@ -395,6 +395,45 @@ def lan_throughput_diagnosis(bits_per_second):
 
 
 # §2 ─────────────────────────────────────────────────────────────────────────────
+def gateway_stability_diagnosis(stats):
+    sent = stats.get("sent", 0)
+    if sent <= 0:
+        return "No gateway samples have been collected yet."
+    loss_pct = stats.get("loss_pct", 0.0)
+    avg_ms = stats.get("avg_ms")
+    max_ms = stats.get("max_ms")
+    jitter_ms = stats.get("jitter_ms")
+    spike_count = stats.get("spike_count", 0)
+    spike_threshold = stats.get("spike_threshold_ms", 0)
+
+    if loss_pct > 0:
+        return (
+            f"Gateway packet loss is {loss_pct:.1f}%. Loss to the first hop usually points to local Wi-Fi, cable, "
+            "switch, router, adapter, or powerline issues before blaming the ISP path."
+        )
+    if spike_count:
+        return (
+            f"Gateway had {spike_count} latency spike(s) above {spike_threshold:.1f} ms. "
+            "If this happens during downloads/uploads, the local router, Wi-Fi, or link may be saturating or struggling."
+        )
+    if max_ms is not None and max_ms >= 50:
+        return (
+            f"Gateway max latency reached {max_ms:.1f} ms. That is high for a local first hop; check Wi-Fi signal, "
+            "router load, cabling, or local congestion."
+        )
+    if jitter_ms is not None and jitter_ms >= 10:
+        return (
+            f"Gateway jitter is {jitter_ms:.1f} ms. Local first-hop timing is inconsistent; check Wi-Fi quality, "
+            "router load, or link saturation."
+        )
+    if avg_ms is not None:
+        return (
+            f"Gateway looks stable: average {avg_ms:.1f} ms, no packet loss. "
+            "If internet tests are still poor, look beyond the local gateway: router WAN, ISP, route, or remote server."
+        )
+    return "Gateway did not return successful latency samples. It may block ping, be unreachable, or be dropping local traffic."
+
+
 class TracerouteWorker(QThread):
     """Runs tracert/traceroute in background and emits each line."""
     line_ready = pyqtSignal(str)
@@ -1252,6 +1291,104 @@ class LanThroughputWorker(QThread):
         return error_text
 
 
+class GatewayStabilityWorker(QThread):
+    """Pings a gateway repeatedly and emits rolling stability statistics."""
+    sample_ready = pyqtSignal(dict)
+    stats_ready = pyqtSignal(dict)
+
+    def __init__(self, target: str, count=30, interval_ms=1000, timeout_ms=1000, spike_threshold_ms=20):
+        super().__init__()
+        self.target = target
+        self.count = count
+        self.interval_ms = interval_ms
+        self.timeout_ms = timeout_ms
+        self.spike_threshold_ms = spike_threshold_ms
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        latencies = []
+        jitters = []
+        prev_latency = None
+        sent = 0
+        received = 0
+        spike_count = 0
+
+        for index in range(1, self.count + 1):
+            if self._stop_requested:
+                break
+            sent += 1
+            latency, raw = self._ping_once()
+            if latency is not None:
+                received += 1
+                latencies.append(latency)
+                if prev_latency is not None:
+                    jitters.append(abs(latency - prev_latency))
+                prev_latency = latency
+                if latency >= self.spike_threshold_ms:
+                    spike_count += 1
+            else:
+                prev_latency = None
+
+            loss_pct = ((sent - received) / sent) * 100 if sent else 0.0
+            avg_ms = sum(latencies) / len(latencies) if latencies else None
+            max_ms = max(latencies) if latencies else None
+            jitter_ms = sum(jitters) / len(jitters) if jitters else None
+            stats = {
+                "target": self.target,
+                "sent": sent,
+                "received": received,
+                "lost": sent - received,
+                "loss_pct": loss_pct,
+                "current_ms": latency,
+                "avg_ms": avg_ms,
+                "max_ms": max_ms,
+                "jitter_ms": jitter_ms,
+                "spike_count": spike_count,
+                "spike_threshold_ms": self.spike_threshold_ms,
+                "complete": index >= self.count or self._stop_requested,
+            }
+            stats["diagnosis"] = gateway_stability_diagnosis(stats)
+            self.sample_ready.emit({
+                "index": index,
+                "latency": latency,
+                "raw": raw,
+                "status": "Timeout" if latency is None else f"{latency:.1f} ms",
+            })
+            self.stats_ready.emit(stats)
+
+            if index < self.count and not self._stop_requested:
+                self.msleep(max(0, int(self.interval_ms)))
+
+    def _ping_once(self):
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(self.timeout_ms), self.target]
+        else:
+            timeout_seconds = max(1, int(math.ceil(self.timeout_ms / 1000)))
+            cmd = ["ping", "-c", "1", "-W", str(timeout_seconds), self.target]
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": max(2, int(math.ceil(self.timeout_ms / 1000)) + 2),
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(cmd, **kwargs)
+        except Exception as e:
+            return None, f"Ping failed: {e}"
+
+        raw = (completed.stdout or completed.stderr or "").strip()
+        match = re.search(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms", raw, re.IGNORECASE)
+        if not match:
+            match = re.search(r"time\s+(\d+(?:\.\d+)?)\s*ms", raw, re.IGNORECASE)
+        if match and completed.returncode == 0:
+            return float(match.group(1)), raw
+        return None, raw or "No ping output"
+
+
 class SpeedTestServerListWorker(QThread):
     """Fetches the LibreSpeed public server list in the background."""
     servers_ready = pyqtSignal(list)
@@ -1426,6 +1563,7 @@ class PingerApp(QWidget):
         self.adapter_info_worker = None
         self.lan_throughput_worker = None
         self.lan_server_process = None
+        self.gateway_stability_worker = None
         self.http_test_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
@@ -1797,6 +1935,23 @@ class PingerApp(QWidget):
         self.lan_throughput_btn.setFixedSize(135, 30)
         self.lan_throughput_btn.setToolTip("Run iperf3 LAN throughput tests")
         self.lan_throughput_btn.clicked.connect(self.show_lan_throughput_window)
+        self.gateway_window = None
+        self.gateway_target_input = None
+        self.gateway_count_spin = None
+        self.gateway_interval_spin = None
+        self.gateway_timeout_spin = None
+        self.gateway_spike_spin = None
+        self.gateway_start_btn = None
+        self.gateway_stop_btn = None
+        self.gateway_status_label = None
+        self.gateway_result_labels = {}
+        self.gateway_diagnosis_box = None
+        self.gateway_raw_box = None
+        self.gateway_last_stats = None
+        self.gateway_stability_btn = QPushButton("Gateway Stability")
+        self.gateway_stability_btn.setFixedSize(135, 30)
+        self.gateway_stability_btn.setToolTip("Monitor default gateway latency, loss, jitter, and spikes")
+        self.gateway_stability_btn.clicked.connect(self.show_gateway_stability_window)
         self.report_window = None
         self.report_checkboxes = {}
         self.report_preview_box = None
@@ -2051,6 +2206,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.speedtest_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.adapter_info_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.lan_throughput_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.gateway_stability_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
@@ -3242,6 +3398,234 @@ class PingerApp(QWidget):
             self.lan_server_stop_btn.setEnabled(False)
         self._set_lan_status("iperf3 server stopped.", "info")
 
+    def show_gateway_stability_window(self):
+        """Open the gateway latency/loss stability monitor."""
+        if self.gateway_window is None:
+            self.gateway_window = QWidget(None, Qt.Window)
+            self.gateway_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.gateway_window.setWindowTitle("Gateway Stability")
+            self.gateway_window.setMinimumSize(820, 620)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Monitor")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.gateway_target_input = QLineEdit(self._default_gateway_target())
+            self.gateway_target_input.setPlaceholderText("Default gateway IP")
+            self.gateway_target_input.setMinimumWidth(260)
+            self.gateway_count_spin = QSpinBox()
+            self.gateway_count_spin.setRange(1, 10000)
+            self.gateway_count_spin.setValue(60)
+            self.gateway_interval_spin = QSpinBox()
+            self.gateway_interval_spin.setRange(100, 10000)
+            self.gateway_interval_spin.setSingleStep(100)
+            self.gateway_interval_spin.setValue(1000)
+            self.gateway_interval_spin.setSuffix(" ms")
+            self.gateway_timeout_spin = QSpinBox()
+            self.gateway_timeout_spin.setRange(250, 10000)
+            self.gateway_timeout_spin.setSingleStep(250)
+            self.gateway_timeout_spin.setValue(1000)
+            self.gateway_timeout_spin.setSuffix(" ms")
+            self.gateway_spike_spin = QSpinBox()
+            self.gateway_spike_spin.setRange(1, 1000)
+            self.gateway_spike_spin.setValue(20)
+            self.gateway_spike_spin.setSuffix(" ms")
+            self.gateway_start_btn = QPushButton("Start Monitor")
+            self.gateway_start_btn.clicked.connect(self.start_gateway_stability)
+            self.gateway_stop_btn = QPushButton("Stop")
+            self.gateway_stop_btn.setEnabled(False)
+            self.gateway_stop_btn.clicked.connect(self.stop_gateway_stability)
+
+            controls.addWidget(QLabel("Target"), 0, 0)
+            controls.addWidget(self.gateway_target_input, 0, 1, 1, 5)
+            controls.addWidget(QLabel("Samples"), 1, 0)
+            controls.addWidget(self.gateway_count_spin, 1, 1)
+            controls.addWidget(QLabel("Interval"), 1, 2)
+            controls.addWidget(self.gateway_interval_spin, 1, 3)
+            controls.addWidget(QLabel("Timeout"), 1, 4)
+            controls.addWidget(self.gateway_timeout_spin, 1, 5)
+            controls.addWidget(QLabel("Spike over"), 2, 0)
+            controls.addWidget(self.gateway_spike_spin, 2, 1)
+            controls.addWidget(self.gateway_start_btn, 2, 4)
+            controls.addWidget(self.gateway_stop_btn, 2, 5)
+            controls.setColumnStretch(1, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.gateway_status_label = QLabel("Ready")
+            self.gateway_status_label.setAlignment(Qt.AlignCenter)
+            self.gateway_status_label.setWordWrap(True)
+            self.gateway_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.gateway_status_label)
+
+            results_group = QGroupBox("Results")
+            results = QGridLayout()
+            results.setHorizontalSpacing(12)
+            results.setVerticalSpacing(8)
+            fields = [
+                ("current", "Current"),
+                ("average", "Average"),
+                ("maximum", "Maximum"),
+                ("jitter", "Jitter"),
+                ("loss", "Packet Loss"),
+                ("spikes", "Spikes"),
+                ("sent", "Sent"),
+                ("received", "Received"),
+            ]
+            self.gateway_result_labels = {}
+            for row, (key, label_text) in enumerate(fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.gateway_result_labels[key] = value
+                results.addWidget(name, row // 2, (row % 2) * 2)
+                results.addWidget(value, row // 2, (row % 2) * 2 + 1)
+            results.setColumnStretch(1, 1)
+            results.setColumnStretch(3, 1)
+            results_group.setLayout(results)
+            layout.addWidget(results_group)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.gateway_diagnosis_box = QTextEdit()
+            self.gateway_diagnosis_box.setReadOnly(True)
+            self.gateway_diagnosis_box.setMinimumHeight(90)
+            self.gateway_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.gateway_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group)
+
+            raw_group = QGroupBox("Ping Log")
+            raw_layout = QVBoxLayout()
+            self.gateway_raw_box = QTextEdit()
+            self.gateway_raw_box.setReadOnly(True)
+            self.gateway_raw_box.setMinimumHeight(160)
+            self.gateway_raw_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            raw_layout.addWidget(self.gateway_raw_box)
+            raw_group.setLayout(raw_layout)
+            layout.addWidget(raw_group, 1)
+
+            self.gateway_window.setLayout(layout)
+
+        if self.gateway_target_input is not None and not self.gateway_target_input.text().strip():
+            self.gateway_target_input.setText(self._default_gateway_target())
+        self.gateway_window.show()
+        self.gateway_window.raise_()
+        self.gateway_window.activateWindow()
+
+    def _default_gateway_target(self):
+        for value in (
+            self.gateway_label.text().strip() if hasattr(self, "gateway_label") else "",
+            get_default_gateway(),
+        ):
+            if value and value not in ("Loading...", "N/A"):
+                return value
+        return ""
+
+    def _set_gateway_status(self, message: str, level="info"):
+        if self.gateway_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.gateway_status_label.setText(message)
+        self.gateway_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }}"
+        )
+
+    def start_gateway_stability(self):
+        if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
+            return
+        target = self.gateway_target_input.text().strip() if self.gateway_target_input is not None else ""
+        if not target:
+            QMessageBox.warning(self, "Gateway Stability Error", "Enter a gateway or first-hop target.")
+            return
+        for label in self.gateway_result_labels.values():
+            label.setText("N/A")
+        if self.gateway_diagnosis_box is not None:
+            self.gateway_diagnosis_box.clear()
+        if self.gateway_raw_box is not None:
+            self.gateway_raw_box.clear()
+        self.gateway_last_stats = None
+        self.gateway_start_btn.setEnabled(False)
+        self.gateway_stop_btn.setEnabled(True)
+        self._set_gateway_status("Monitoring gateway stability...", "running")
+
+        self.gateway_stability_worker = GatewayStabilityWorker(
+            target,
+            count=self.gateway_count_spin.value(),
+            interval_ms=self.gateway_interval_spin.value(),
+            timeout_ms=self.gateway_timeout_spin.value(),
+            spike_threshold_ms=self.gateway_spike_spin.value(),
+        )
+        self.gateway_stability_worker.sample_ready.connect(self._add_gateway_sample)
+        self.gateway_stability_worker.stats_ready.connect(self._set_gateway_stats)
+        self.gateway_stability_worker.finished.connect(self._finish_gateway_stability)
+        self.gateway_stability_worker.finished.connect(self.gateway_stability_worker.deleteLater)
+        self.gateway_stability_worker.finished.connect(lambda: setattr(self, "gateway_stability_worker", None))
+        self.gateway_stability_worker.start()
+
+    def stop_gateway_stability(self):
+        if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
+            self.gateway_stability_worker.stop()
+            self._set_gateway_status("Stopping gateway monitor...", "running")
+
+    def _add_gateway_sample(self, sample: dict):
+        if self.gateway_raw_box is None:
+            return
+        raw = sample.get("raw", "").strip()
+        self.gateway_raw_box.append(f"Sample {sample.get('index')}: {sample.get('status')}")
+        if raw:
+            self.gateway_raw_box.append(raw)
+        self.gateway_raw_box.append("")
+
+    def _set_gateway_stats(self, stats: dict):
+        self.gateway_last_stats = stats
+        values = {
+            "current": "Timeout" if stats.get("current_ms") is None else f"{stats.get('current_ms'):.1f} ms",
+            "average": "N/A" if stats.get("avg_ms") is None else f"{stats.get('avg_ms'):.1f} ms",
+            "maximum": "N/A" if stats.get("max_ms") is None else f"{stats.get('max_ms'):.1f} ms",
+            "jitter": "N/A" if stats.get("jitter_ms") is None else f"{stats.get('jitter_ms'):.1f} ms",
+            "loss": f"{stats.get('loss_pct', 0):.1f}%",
+            "spikes": f"{stats.get('spike_count', 0)} over {stats.get('spike_threshold_ms', 0):.0f} ms",
+            "sent": str(stats.get("sent", 0)),
+            "received": str(stats.get("received", 0)),
+        }
+        for key, value in values.items():
+            if key in self.gateway_result_labels:
+                self.gateway_result_labels[key].setText(value)
+        if self.gateway_diagnosis_box is not None:
+            self.gateway_diagnosis_box.setPlainText(stats.get("diagnosis", "N/A"))
+
+    def _finish_gateway_stability(self):
+        if self.gateway_start_btn is not None:
+            self.gateway_start_btn.setEnabled(True)
+        if self.gateway_stop_btn is not None:
+            self.gateway_stop_btn.setEnabled(False)
+        if self.gateway_last_stats is not None:
+            level = "ok" if self.gateway_last_stats.get("loss_pct", 0) == 0 and self.gateway_last_stats.get("spike_count", 0) == 0 else "error"
+            self._set_gateway_status("Gateway stability monitor completed.", level)
+        else:
+            self._set_gateway_status("Gateway stability monitor stopped.", "info")
+
     def show_http_test_window(self):
         """Open the HTTP/HTTPS diagnostic window."""
         if self.http_window is None:
@@ -3958,6 +4342,15 @@ class PingerApp(QWidget):
             <li>If LAN throughput is gigabit-class but internet Speed Test is low, focus on router WAN, ISP profile, speed test server, or congestion.</li>
         </ul>
 
+        <h3>Gateway Stability</h3>
+        <ul>
+            <li>Pings the default gateway or first-hop target repeatedly and tracks local first-hop latency, packet loss, jitter, and spikes.</li>
+            <li><b>Samples</b> controls how many pings to send. <b>Interval</b> controls the delay between samples. <b>Timeout</b> controls how long each ping can wait.</li>
+            <li><b>Spike over</b> counts any gateway reply above that latency threshold.</li>
+            <li>Run it before and during heavy downloads, uploads, or Speed Test. If gateway latency spikes or drops packets under load, the local router, Wi-Fi, cable, switch, or adapter path is struggling.</li>
+            <li>If the gateway stays stable while internet speed is poor, the problem is more likely beyond the local LAN, such as router WAN, ISP, route, or remote server.</li>
+        </ul>
+
         <h3>Speed Test</h3>
         <ul>
             <li>Uses LibreSpeed CLI to measure download, upload, latency, and jitter.</li>
@@ -4022,7 +4415,7 @@ class PingerApp(QWidget):
         <h3>Report</h3>
         <ul>
             <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
-            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
+            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
             <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
             <li><b>Save as TXT</b> writes the current report to a text file.</li>
         </ul>
@@ -4056,6 +4449,7 @@ class PingerApp(QWidget):
                 ("adapter_info", "Adapter info"),
                 ("ping_stats", "Ping stats"),
                 ("lan_throughput", "LAN Throughput"),
+                ("gateway_stability", "Gateway Stability"),
                 ("speedtest_history", "Speed Test history"),
                 ("dns_lookup", "Last DNS lookup"),
                 ("traceroute", "Last traceroute"),
@@ -4146,6 +4540,7 @@ class PingerApp(QWidget):
             ("adapter_info", "Adapter Info", self._report_adapter_info_lines),
             ("ping_stats", "Ping Stats", self._report_ping_stats_lines),
             ("lan_throughput", "LAN Throughput", self._report_lan_throughput_lines),
+            ("gateway_stability", "Gateway Stability", self._report_gateway_stability_lines),
             ("speedtest_history", "Speed Test History", self._report_speedtest_history_lines),
             ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
             ("traceroute", "Last Traceroute", self._report_traceroute_lines),
@@ -4259,6 +4654,29 @@ class PingerApp(QWidget):
             "",
             "Diagnosis:",
             result.get("diagnosis", "N/A"),
+        ]
+
+    def _report_gateway_stability_lines(self):
+        if not self.gateway_last_stats:
+            return ["No Gateway Stability result available."]
+        stats = self.gateway_last_stats
+        def ms_value(key, empty="N/A"):
+            value = stats.get(key)
+            return empty if value is None else f"{value:.1f} ms"
+        return [
+            f"Target: {stats.get('target', 'N/A')}",
+            f"Sent: {stats.get('sent', 0)}",
+            f"Received: {stats.get('received', 0)}",
+            f"Lost: {stats.get('lost', 0)}",
+            f"Packet Loss: {stats.get('loss_pct', 0):.1f}%",
+            f"Current: {ms_value('current_ms', 'Timeout')}",
+            f"Average: {ms_value('avg_ms')}",
+            f"Maximum: {ms_value('max_ms')}",
+            f"Jitter: {ms_value('jitter_ms')}",
+            f"Spikes: {stats.get('spike_count', 0)} over {stats.get('spike_threshold_ms', 0):.0f} ms",
+            "",
+            "Diagnosis:",
+            stats.get("diagnosis", "N/A"),
         ]
 
     def _report_speedtest_history_lines(self):
@@ -5477,6 +5895,8 @@ class PingerApp(QWidget):
     def closeEvent(self, event):
         self.timer.stop()
         self.elapsed_timer.stop()
+        if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
+            self.gateway_stability_worker.stop()
         self.stop_lan_server()
         self._close_ping_socket()
         super().closeEvent(event)

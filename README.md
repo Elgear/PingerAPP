@@ -20,6 +20,7 @@ The right-side Tools panel opens separate diagnostic windows:
 - Speed Test: LibreSpeed-based internet speed test with persistent history.
 - Adapter Info: active adapter link speed, status, type, IP, gateway, DNS, MAC, duplex setting where available, and diagnosis for 100 Mbps vs gigabit negotiation.
 - LAN Throughput: bundled iperf3 client/server tool for testing local network throughput separately from internet speed.
+- Gateway Stability: repeated first-hop ping monitor for gateway latency, packet loss, jitter, and spikes.
 - Network Scanner: safe TCP connect scanning for one host or an IPv4 subnet, with grouped Target/Scan/Display controls, section header help beside each section label, common CIDR size selection, named port presets with exact-port preview, stop control, grouped-by-host wrapped results, separate Host State, Open Ports, and Port State columns, result filtering, highlighted open/live rows, host discovery, full-port/specific-port presets, open/closed/filtered state reporting, service names, optional light service probes, progress, latency, and hostname/MAC lookup through reverse DNS, ARP, and Windows NetBIOS where available.
 - HTTP Test: HTTP/HTTPS request diagnostics with GET/HEAD, redirect control, optional self-signed certificate allowance for local HTTPS tests, timing, final URL, TLS certificate summary, headers, and error details.
 - DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.
@@ -27,7 +28,7 @@ The right-side Tools panel opens separate diagnostic windows:
 - MTU Test: find the largest non-fragmenting ping payload and estimated path MTU, with raw ping output details.
 - Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
 - Alerts: threshold alert log.
-- Report: selectable troubleshooting report with preview and `.txt` export for Host Info, Adapter Info, ping stats, LAN Throughput, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results.
+- Report: selectable troubleshooting report with preview and `.txt` export for Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results.
 - Help: offline field guide explaining the main panels, controls, graph readings, tool workflows, report output, and common diagnostic meanings.
 
 MAC addresses can only be discovered when the target exposes them on the local network path. Routed hosts usually show no MAC address, or only the next-hop device in the local ARP cache.
