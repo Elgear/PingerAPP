@@ -593,6 +593,84 @@ def route_health_diagnosis(result):
         "router/WAN throughput, ISP profile, speed test server choice, or endpoint limits."
     )
 
+def wifi_protocol_name(radio_type):
+    value = (radio_type or "").lower()
+    if "802.11be" in value:
+        return "Wi-Fi 7 (802.11be)"
+    if "802.11ax" in value:
+        return "Wi-Fi 6/6E (802.11ax)"
+    if "802.11ac" in value:
+        return "Wi-Fi 5 (802.11ac)"
+    if "802.11n" in value:
+        return "Wi-Fi 4 (802.11n)"
+    if "802.11g" in value:
+        return "Wi-Fi 3 / legacy 802.11g"
+    if "802.11b" in value:
+        return "Wi-Fi 1 / legacy 802.11b"
+    if radio_type:
+        return radio_type
+    return "N/A"
+
+def wifi_band_from_channel(channel_text, band_text=""):
+    band = (band_text or "").strip()
+    if band:
+        return band
+    try:
+        channel = int(re.search(r"\d+", str(channel_text)).group(0))
+    except Exception:
+        return "N/A"
+    if channel <= 14:
+        return "2.4 GHz"
+    return "5 GHz or 6 GHz"
+
+def parse_percent(value):
+    match = re.search(r"(\d+(?:\.\d+)?)", str(value or ""))
+    return None if not match else float(match.group(1))
+
+def parse_mbps(value):
+    match = re.search(r"(\d+(?:\.\d+)?)", str(value or ""))
+    return None if not match else float(match.group(1))
+
+def wifi_diagnosis(info):
+    if info.get("available") is False:
+        return info.get("error") or "Windows did not report an active Wi-Fi interface."
+
+    state = str(info.get("state") or "").lower()
+    if state and "connected" not in state:
+        return "Wi-Fi adapter is present but not connected. Connect to Wi-Fi before using this diagnostic."
+
+    signal = parse_percent(info.get("signal"))
+    rx_rate = parse_mbps(info.get("receive_rate"))
+    tx_rate = parse_mbps(info.get("transmit_rate"))
+    link_rate = max(value for value in (rx_rate or 0, tx_rate or 0))
+    band = str(info.get("band") or "").lower()
+    protocol = str(info.get("protocol") or info.get("radio_type") or "").lower()
+
+    issues = []
+    if signal is not None:
+        if signal < 50:
+            issues.append(f"Signal is weak at {signal:.0f}%. Move closer to the access point or reduce interference.")
+        elif signal < 70:
+            issues.append(f"Signal is fair at {signal:.0f}%. Throughput may be unstable or below expected speed.")
+    if "2.4" in band:
+        issues.append("Connection is on 2.4 GHz. That band often cannot deliver high broadband speeds, especially in busy areas.")
+    if any(token in protocol for token in ("802.11b", "802.11g", "802.11n")):
+        issues.append(f"Protocol is {info.get('protocol', info.get('radio_type', 'legacy Wi-Fi'))}. For gigabit-class internet, Wi-Fi 5/6/7 is usually needed.")
+    if link_rate:
+        if link_rate < 150:
+            issues.append(f"Link rate is only {link_rate:.0f} Mbps, which is consistent with a major Wi-Fi bottleneck.")
+        elif link_rate < 500:
+            issues.append(f"Link rate is {link_rate:.0f} Mbps. Real speed tests are normally well below link rate, so gigabit results are unlikely.")
+        elif link_rate < 900:
+            issues.append(f"Link rate is {link_rate:.0f} Mbps. This can be normal for Wi-Fi, but it may not support full gigabit throughput.")
+
+    if issues:
+        return " ".join(issues)
+    return (
+        "Wi-Fi link details look healthy. If speed is still low, compare Adapter Info, LAN Throughput, Route Health, "
+        "speed test server choice, router WAN, and ISP profile."
+    )
+
 
 class TracerouteWorker(QThread):
     """Runs tracert/traceroute in background and emits each line."""
@@ -2206,6 +2284,112 @@ class RouteHealthWorker(QThread):
         return result
 
 
+class WifiDiagnosticsWorker(QThread):
+    """Reads Windows Wi-Fi connection details without blocking the UI."""
+    result_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def run(self):
+        if platform.system() != "Windows":
+            self.result_ready.emit({
+                "available": False,
+                "error": "Wi-Fi Diagnostics currently uses Windows WLAN commands.",
+                "diagnosis": "Wi-Fi Diagnostics is currently implemented for Windows only.",
+                "raw": "",
+            })
+            return
+
+        try:
+            info = self._windows_wifi_info()
+        except Exception as e:
+            self.error_ready.emit(f"Wi-Fi diagnostics failed: {e}")
+            return
+        self.result_ready.emit(info)
+
+    def _windows_wifi_info(self):
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 10,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        interfaces = subprocess.run(["netsh", "wlan", "show", "interfaces"], **kwargs)
+        drivers = subprocess.run(["netsh", "wlan", "show", "drivers"], **kwargs)
+        raw_interfaces = (interfaces.stdout or interfaces.stderr or "").strip()
+        raw_drivers = (drivers.stdout or drivers.stderr or "").strip()
+        raw = "\n\nnetsh wlan show interfaces\n" + raw_interfaces
+        raw += "\n\nnetsh wlan show drivers\n" + raw_drivers
+
+        if interfaces.returncode != 0:
+            message = raw_interfaces or "Windows did not return Wi-Fi interface details."
+            info = {
+                "available": False,
+                "error": message,
+                "raw": raw,
+            }
+            info["diagnosis"] = wifi_diagnosis(info)
+            return info
+
+        parsed = self._parse_netsh_fields(raw_interfaces)
+        driver_fields = self._parse_netsh_fields(raw_drivers)
+        radio_type = first_available(parsed.get("radio_type"), parsed.get("radio type"))
+        channel = first_available(parsed.get("channel"))
+        band = wifi_band_from_channel(channel, first_available(parsed.get("band")))
+        protocol = wifi_protocol_name(radio_type)
+        supported = first_available(driver_fields.get("radio_types_supported"), driver_fields.get("radio types supported"))
+        info = {
+            "available": True,
+            "name": first_available(parsed.get("name")),
+            "description": first_available(parsed.get("description")),
+            "guid": first_available(parsed.get("guid")),
+            "mac": first_available(parsed.get("physical_address"), parsed.get("physical address")),
+            "state": first_available(parsed.get("state")),
+            "ssid": first_available(parsed.get("ssid")),
+            "bssid": first_available(parsed.get("bssid")),
+            "network_type": first_available(parsed.get("network_type"), parsed.get("network type")),
+            "radio_type": radio_type,
+            "protocol": protocol,
+            "band": band,
+            "channel": channel,
+            "signal": first_available(parsed.get("signal")),
+            "receive_rate": self._rate_text(first_available(parsed.get("receive_rate_mbps"), parsed.get("receive rate (mbps)"))),
+            "transmit_rate": self._rate_text(first_available(parsed.get("transmit_rate_mbps"), parsed.get("transmit rate (mbps)"))),
+            "authentication": first_available(parsed.get("authentication")),
+            "cipher": first_available(parsed.get("cipher")),
+            "profile": first_available(parsed.get("profile")),
+            "supported_radios": supported,
+            "raw": raw,
+        }
+        info["diagnosis"] = wifi_diagnosis(info)
+        return info
+
+    def _parse_netsh_fields(self, text):
+        fields = {}
+        for line in text.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+            value = value.strip()
+            if not key or not value:
+                continue
+            if key in fields:
+                fields[key] = f"{fields[key]}, {value}"
+            else:
+                fields[key] = value
+        return fields
+
+    def _rate_text(self, value):
+        if value in (None, "", "N/A"):
+            return "N/A"
+        numeric = parse_mbps(value)
+        return f"{numeric:.0f} Mbps" if numeric is not None else str(value)
+
+
 class SpeedTestServerListWorker(QThread):
     """Fetches the LibreSpeed public server list in the background."""
     servers_ready = pyqtSignal(list)
@@ -2800,6 +2984,18 @@ class PingerApp(QWidget):
         self.route_health_btn.setFixedSize(135, 30)
         self.route_health_btn.setToolTip("Ping gateway, ISP hop, and public target during speed-test load")
         self.route_health_btn.clicked.connect(self.show_route_health_window)
+        self.wifi_worker = None
+        self.wifi_window = None
+        self.wifi_refresh_btn = None
+        self.wifi_status_label = None
+        self.wifi_labels = {}
+        self.wifi_diagnosis_box = None
+        self.wifi_raw_box = None
+        self.wifi_last_result = None
+        self.wifi_tool_btn = QPushButton("Wi-Fi Diagnostics")
+        self.wifi_tool_btn.setFixedSize(135, 30)
+        self.wifi_tool_btn.setToolTip("Check Wi-Fi SSID, signal, band, channel, protocol, and link rates")
+        self.wifi_tool_btn.clicked.connect(self.show_wifi_diagnostics_window)
         self.loaded_window = None
         self.loaded_target_input = None
         self.loaded_baseline_spin = None
@@ -3074,6 +3270,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.gateway_stability_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.loaded_latency_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.route_health_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.wifi_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
@@ -4994,6 +5191,162 @@ class PingerApp(QWidget):
         if self.route_last_result is None and self.route_last_error is None:
             self._set_route_status("Route health test stopped.", "info")
 
+    def show_wifi_diagnostics_window(self):
+        """Open Wi-Fi signal/link diagnostics."""
+        if self.wifi_window is None:
+            self.wifi_window = QWidget(None, Qt.Window)
+            self.wifi_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.wifi_window.setWindowTitle("Wi-Fi Diagnostics")
+            self.wifi_window.setMinimumSize(820, 640)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls = QHBoxLayout()
+            self.wifi_refresh_btn = QPushButton("Refresh Wi-Fi Diagnostics")
+            self.wifi_refresh_btn.clicked.connect(self.refresh_wifi_diagnostics)
+            controls.addWidget(self.wifi_refresh_btn)
+            controls.addStretch(1)
+            layout.addLayout(controls)
+
+            self.wifi_status_label = QLabel("Ready")
+            self.wifi_status_label.setAlignment(Qt.AlignCenter)
+            self.wifi_status_label.setWordWrap(True)
+            self.wifi_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.wifi_status_label)
+
+            details_group = QGroupBox("Connection")
+            details = QGridLayout()
+            details.setContentsMargins(10,10,10,10)
+            details.setHorizontalSpacing(12)
+            details.setVerticalSpacing(8)
+            fields = [
+                ("state", "State"),
+                ("ssid", "SSID"),
+                ("bssid", "BSSID"),
+                ("signal", "Signal"),
+                ("band", "Band"),
+                ("channel", "Channel"),
+                ("protocol", "Protocol"),
+                ("radio_type", "Radio Type"),
+                ("receive_rate", "Receive Rate"),
+                ("transmit_rate", "Transmit Rate"),
+                ("authentication", "Authentication"),
+                ("cipher", "Cipher"),
+                ("name", "Interface"),
+                ("description", "Description"),
+                ("mac", "Adapter MAC"),
+                ("supported_radios", "Supported Radios"),
+            ]
+            self.wifi_labels = {}
+            for row, (key, label_text) in enumerate(fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.wifi_labels[key] = value
+                details.addWidget(name, row // 2, (row % 2) * 2)
+                details.addWidget(value, row // 2, (row % 2) * 2 + 1)
+            details.setColumnStretch(1, 1)
+            details.setColumnStretch(3, 1)
+            details_group.setLayout(details)
+            layout.addWidget(details_group)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.wifi_diagnosis_box = QTextEdit()
+            self.wifi_diagnosis_box.setReadOnly(True)
+            self.wifi_diagnosis_box.setMinimumHeight(100)
+            self.wifi_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.wifi_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group)
+
+            raw_group = QGroupBox("Raw Wi-Fi Command Output")
+            raw_layout = QVBoxLayout()
+            self.wifi_raw_box = QTextEdit()
+            self.wifi_raw_box.setReadOnly(True)
+            self.wifi_raw_box.setMinimumHeight(150)
+            self.wifi_raw_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            raw_layout.addWidget(self.wifi_raw_box)
+            raw_group.setLayout(raw_layout)
+            layout.addWidget(raw_group, 1)
+
+            self.wifi_window.setLayout(layout)
+
+        self.wifi_window.show()
+        self.wifi_window.raise_()
+        self.wifi_window.activateWindow()
+        self.refresh_wifi_diagnostics()
+
+    def _set_wifi_status(self, message: str, level="info"):
+        if self.wifi_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.wifi_status_label.setText(message)
+        self.wifi_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+    def refresh_wifi_diagnostics(self):
+        if self.wifi_worker is not None and self.wifi_worker.isRunning():
+            return
+        if self.wifi_refresh_btn is not None:
+            self.wifi_refresh_btn.setEnabled(False)
+        self._set_wifi_status("Reading Wi-Fi details...", "running")
+        self.wifi_worker = WifiDiagnosticsWorker()
+        self.wifi_worker.result_ready.connect(self._set_wifi_result)
+        self.wifi_worker.error_ready.connect(self._set_wifi_error)
+        self.wifi_worker.finished.connect(self._finish_wifi_diagnostics)
+        self.wifi_worker.finished.connect(self.wifi_worker.deleteLater)
+        self.wifi_worker.finished.connect(lambda: setattr(self, "wifi_worker", None))
+        self.wifi_worker.start()
+
+    def _set_wifi_result(self, info: dict):
+        self.wifi_last_result = info
+        for key, label in self.wifi_labels.items():
+            value = str(info.get(key, "N/A") or "N/A")
+            label.setText(value)
+            label.setToolTip(value)
+        if self.wifi_diagnosis_box is not None:
+            self.wifi_diagnosis_box.setPlainText(info.get("diagnosis", "N/A"))
+        if self.wifi_raw_box is not None:
+            self.wifi_raw_box.setPlainText(info.get("raw", ""))
+        if info.get("available") is False:
+            self._set_wifi_status("Wi-Fi details unavailable.", "error")
+        else:
+            self._set_wifi_status("Wi-Fi diagnostics loaded.", "ok")
+
+    def _set_wifi_error(self, message: str):
+        self.wifi_last_result = {
+            "available": False,
+            "error": message,
+            "diagnosis": message,
+        }
+        if self.wifi_diagnosis_box is not None:
+            self.wifi_diagnosis_box.setPlainText(message)
+        self._set_wifi_status(message, "error")
+
+    def _finish_wifi_diagnostics(self):
+        if self.wifi_refresh_btn is not None:
+            self.wifi_refresh_btn.setEnabled(True)
+
     def show_loaded_latency_window(self):
         """Open the bufferbloat / loaded latency diagnostic window."""
         if self.loaded_window is None:
@@ -5979,6 +6332,15 @@ class PingerApp(QWidget):
             <li>Use this when raw speed, loaded latency, or gateway checks are not enough to locate where the slowdown starts.</li>
         </ul>
 
+        <h3>Wi-Fi Diagnostics</h3>
+        <ul>
+            <li>Shows the current Windows Wi-Fi connection: SSID, BSSID, signal, band, channel, protocol, authentication, cipher, and link rates.</li>
+            <li><b>Signal</b> below about 70% can reduce speed or stability; below 50% is usually a strong warning sign.</li>
+            <li><b>Band</b> matters. 2.4 GHz is range-friendly but often slow or congested. 5/6 GHz is usually better for high broadband speeds.</li>
+            <li><b>Receive/Transmit Rate</b> is the Wi-Fi link rate, not real throughput. Speed tests are normally lower than this value.</li>
+            <li>Use this when a gigabit service looks slow over Wi-Fi, especially when Adapter Info and LAN/Route tests do not show a wired bottleneck.</li>
+        </ul>
+
         <h3>Speed Test</h3>
         <ul>
             <li>Uses LibreSpeed CLI to measure download, upload, latency, and jitter.</li>
@@ -6044,7 +6406,7 @@ class PingerApp(QWidget):
         <h3>Report</h3>
         <ul>
             <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
-            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
+            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Wi-Fi Diagnostics, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
             <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
             <li><b>Save as TXT</b> writes the current report to a text file.</li>
         </ul>
@@ -6081,6 +6443,7 @@ class PingerApp(QWidget):
                 ("gateway_stability", "Gateway Stability"),
                 ("loaded_latency", "Loaded Latency"),
                 ("route_health", "Route Health"),
+                ("wifi_diagnostics", "Wi-Fi Diagnostics"),
                 ("speedtest_history", "Speed Test history"),
                 ("dns_lookup", "Last DNS lookup"),
                 ("traceroute", "Last traceroute"),
@@ -6174,6 +6537,7 @@ class PingerApp(QWidget):
             ("gateway_stability", "Gateway Stability", self._report_gateway_stability_lines),
             ("loaded_latency", "Loaded Latency", self._report_loaded_latency_lines),
             ("route_health", "Route Health", self._report_route_health_lines),
+            ("wifi_diagnostics", "Wi-Fi Diagnostics", self._report_wifi_diagnostics_lines),
             ("speedtest_history", "Speed Test History", self._report_speedtest_history_lines),
             ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
             ("traceroute", "Last Traceroute", self._report_traceroute_lines),
@@ -6383,6 +6747,34 @@ class PingerApp(QWidget):
                 f"  Avg/Max/Jitter: {ms_value('avg_ms')} / {ms_value('max_ms')} / {ms_value('jitter_ms')}",
                 f"  Spikes: {stats.get('spike_count', 0)} over {stats.get('spike_threshold_ms', 0):.0f} ms",
             ])
+        lines.extend(["", "Diagnosis:", result.get("diagnosis", "N/A")])
+        return lines
+
+    def _report_wifi_diagnostics_lines(self):
+        if not self.wifi_last_result:
+            return ["No Wi-Fi Diagnostics result available."]
+        result = self.wifi_last_result
+        rows = [
+            ("State", "state"),
+            ("SSID", "ssid"),
+            ("BSSID", "bssid"),
+            ("Signal", "signal"),
+            ("Band", "band"),
+            ("Channel", "channel"),
+            ("Protocol", "protocol"),
+            ("Radio Type", "radio_type"),
+            ("Receive Rate", "receive_rate"),
+            ("Transmit Rate", "transmit_rate"),
+            ("Authentication", "authentication"),
+            ("Cipher", "cipher"),
+            ("Interface", "name"),
+            ("Description", "description"),
+            ("Adapter MAC", "mac"),
+            ("Supported Radios", "supported_radios"),
+        ]
+        lines = [f"{label}: {result.get(key, 'N/A') or 'N/A'}" for label, key in rows]
+        if result.get("error"):
+            lines.extend(["", "Error:", result.get("error", "N/A")])
         lines.extend(["", "Diagnosis:", result.get("diagnosis", "N/A")])
         return lines
 
@@ -7604,6 +7996,9 @@ class PingerApp(QWidget):
             self.loaded_latency_worker.stop()
         if self.route_health_worker is not None and self.route_health_worker.isRunning():
             self.route_health_worker.stop()
+        if self.wifi_worker is not None and self.wifi_worker.isRunning():
+            self.wifi_worker.quit()
+            self.wifi_worker.wait(1000)
         if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
             self.gateway_stability_worker.stop()
         self.stop_lan_server()

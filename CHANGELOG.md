@@ -50,6 +50,7 @@
 - Added a Loaded Latency bufferbloat tool that compares idle ping latency with latency while LibreSpeed load is running, with loss/jitter, diagnosis, Help, and Report support.
 - Fixed Loaded Latency download/upload result formatting so LibreSpeed Mbps values display correctly.
 - Added a Route Health tool that runs LibreSpeed load while pinging gateway, ISP first hop, and public target to identify where slowdown starts.
+- Added a Wi-Fi Diagnostics tool for SSID, signal, band, channel, protocol, link rates, security details, diagnosis, Help, and Report support.
 
 ## 2026-05-07
 
