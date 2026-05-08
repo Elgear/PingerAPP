@@ -52,6 +52,7 @@
 - Added a Route Health tool that runs LibreSpeed load while pinging gateway, ISP first hop, and public target to identify where slowdown starts.
 - Added a Wi-Fi Diagnostics tool for SSID, signal, band, channel, protocol, link rates, security details, diagnosis, Help, and Report support.
 - Added a Speed Targets tool to compare short LibreSpeed runs across multiple servers and diagnose poor server/CDN target selection.
+- Updated Speed Targets so selected table rows are compared, with the top fallback count used only when no rows are selected.
 
 ## 2026-05-07
 

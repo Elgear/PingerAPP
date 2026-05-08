@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QFileDialog, QGroupBox, QSlider, QTextEdit,
     QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox, QProgressBar,
-    QTreeWidget, QTreeWidgetItem, QToolButton, QToolTip
+    QTreeWidget, QTreeWidgetItem, QToolButton, QToolTip, QAbstractItemView
 )
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -5568,19 +5568,19 @@ class PingerApp(QWidget):
             self.speed_targets_count_spin = QSpinBox()
             self.speed_targets_count_spin.setRange(1, 10)
             self.speed_targets_count_spin.setValue(3)
-            self.speed_targets_count_spin.setToolTip("Number of listed LibreSpeed targets to compare, starting from the top of the refreshed list.")
+            self.speed_targets_count_spin.setToolTip("Fallback number of top listed targets to compare when no table rows are selected.")
             self.speed_targets_duration_spin = QSpinBox()
             self.speed_targets_duration_spin.setRange(3, 20)
             self.speed_targets_duration_spin.setValue(5)
             self.speed_targets_duration_spin.setSuffix(" sec")
             self.speed_targets_duration_spin.setToolTip("Short test duration per target. Higher is more stable but uses more data.")
-            self.speed_targets_run_btn = QPushButton("Compare Targets")
+            self.speed_targets_run_btn = QPushButton("Compare Selected")
             self.speed_targets_run_btn.clicked.connect(self.start_speed_targets_compare)
             self.speed_targets_stop_btn = QPushButton("Stop")
             self.speed_targets_stop_btn.setEnabled(False)
             self.speed_targets_stop_btn.clicked.connect(self.stop_speed_targets_compare)
             controls.addWidget(self.speed_targets_refresh_btn, 0, 0)
-            controls.addWidget(QLabel("Targets"), 0, 1)
+            controls.addWidget(QLabel("Fallback count"), 0, 1)
             controls.addWidget(self.speed_targets_count_spin, 0, 2)
             controls.addWidget(QLabel("Duration each"), 0, 3)
             controls.addWidget(self.speed_targets_duration_spin, 0, 4)
@@ -5607,6 +5607,7 @@ class PingerApp(QWidget):
             self.speed_targets_table.setAlternatingRowColors(True)
             self.speed_targets_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self.speed_targets_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.speed_targets_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
             header = self.speed_targets_table.horizontalHeader()
             for col in range(0, 10):
                 header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
@@ -5686,7 +5687,7 @@ class PingerApp(QWidget):
         self.speed_targets_last_result = None
         if self.speed_targets_diagnosis_box is not None:
             self.speed_targets_diagnosis_box.setPlainText(
-                "Targets loaded. Compare a few listed servers to see whether server/CDN choice changes the result."
+                "Targets loaded. Select any server rows to compare them, or leave the table unselected to compare the top fallback count."
             )
         self._populate_speed_targets_table(servers)
         self._set_speed_targets_status(f"Loaded {len(servers)} LibreSpeed targets.", "ok")
@@ -5720,6 +5721,32 @@ class PingerApp(QWidget):
         if self.speed_targets_diagnosis_box is not None:
             self.speed_targets_diagnosis_box.setPlainText(message)
 
+    def _selected_speed_target_rows(self):
+        if self.speed_targets_table is None or self.speed_targets_table.selectionModel() is None:
+            return []
+        rows = {index.row() for index in self.speed_targets_table.selectionModel().selectedRows()}
+        if not rows:
+            rows = {index.row() for index in self.speed_targets_table.selectedIndexes()}
+        return sorted(row for row in rows if 0 <= row < len(self.speed_targets_servers))
+
+    def _selected_speed_target_servers(self):
+        rows = self._selected_speed_target_rows()
+        if rows:
+            return [self.speed_targets_servers[row] for row in rows]
+        count = self.speed_targets_count_spin.value() if self.speed_targets_count_spin is not None else 3
+        return self.speed_targets_servers[:count]
+
+    def _select_speed_target_rows(self, rows):
+        if self.speed_targets_table is None:
+            return
+        self.speed_targets_table.clearSelection()
+        for row in rows:
+            if 0 <= row < self.speed_targets_table.rowCount():
+                for col in range(self.speed_targets_table.columnCount()):
+                    item = self.speed_targets_table.item(row, col)
+                    if item is not None:
+                        item.setSelected(True)
+
     def start_speed_targets_compare(self):
         if self.speed_targets_compare_worker is not None and self.speed_targets_compare_worker.isRunning():
             return
@@ -5734,14 +5761,22 @@ class PingerApp(QWidget):
             QMessageBox.warning(self, "Speed Targets Error", "Refresh targets before comparing them.")
             return
 
-        count = self.speed_targets_count_spin.value() if self.speed_targets_count_spin is not None else 3
-        selected = self.speed_targets_servers[:count]
+        selected_rows = self._selected_speed_target_rows()
+        selected = self._selected_speed_target_servers()
+        if len(selected) > 10:
+            QMessageBox.warning(self, "Speed Targets Limit", "Compare up to 10 selected targets at a time.")
+            return
         self.speed_targets_last_result = None
         if self.speed_targets_diagnosis_box is not None:
             self.speed_targets_diagnosis_box.clear()
         self._populate_speed_targets_table(self.speed_targets_servers)
+        if selected_rows:
+            self._select_speed_target_rows(selected_rows)
         self._set_speed_targets_controls_enabled(False, running=True)
-        self._set_speed_targets_status("Comparing speed targets...", "running")
+        self._set_speed_targets_status(
+            "Comparing selected speed targets..." if selected_rows else "Comparing top fallback targets...",
+            "running",
+        )
         self.speed_targets_compare_worker = SpeedTargetCompareWorker(
             executable,
             selected,
@@ -6801,7 +6836,8 @@ class PingerApp(QWidget):
         <h3>Speed Targets</h3>
         <ul>
             <li>Compares multiple LibreSpeed test targets with short runs to check whether server/CDN choice changes the result.</li>
-            <li><b>Targets</b> controls how many refreshed LibreSpeed servers to test, starting from the top of the list.</li>
+            <li>Select one or more server rows, then use <b>Compare Selected</b>. If no rows are selected, the top fallback count is used.</li>
+            <li><b>Fallback count</b> controls how many top listed servers are tested only when no table rows are selected.</li>
             <li><b>Duration each</b> keeps the comparison short. Increase it only when you need more stable numbers.</li>
             <li>If one target is much slower than another, a single poor speed test server, CDN target, or route can be misleading.</li>
         </ul>

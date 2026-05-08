@@ -24,7 +24,7 @@ The right-side Tools panel opens separate diagnostic windows:
 - Loaded Latency: bufferbloat check that compares idle ping latency with latency while LibreSpeed load is running.
 - Route Health: LibreSpeed load plus simultaneous gateway, ISP first-hop, and public-target ping health checks to locate where slowdown starts.
 - Wi-Fi Diagnostics: Windows Wi-Fi SSID, BSSID, signal, band, channel, protocol, link rates, authentication, cipher, and diagnosis for wireless speed limits.
-- Speed Targets: compare several LibreSpeed servers with short tests to detect poor speed test server/CDN target selection.
+- Speed Targets: select and compare LibreSpeed servers with short tests to detect poor speed test server/CDN target selection.
 - Network Scanner: safe TCP connect scanning for one host or an IPv4 subnet, with grouped Target/Scan/Display controls, section header help beside each section label, common CIDR size selection, named port presets plus a manual port entry field with exact-port preview, stop control, grouped-by-host wrapped results, separate Host State, Open Ports, and Port State columns, result filtering, highlighted open/live rows, host discovery, full-port/specific-port presets, open/closed/filtered state reporting, service names, optional light service probes, progress, latency, and hostname/MAC lookup through reverse DNS, ARP, and Windows NetBIOS where available.
 - HTTP Test: HTTP/HTTPS request diagnostics with GET/HEAD, redirect control, optional self-signed certificate allowance for local HTTPS tests, timing, final URL, TLS certificate summary, headers, and error details.
 - DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.

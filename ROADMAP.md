@@ -57,7 +57,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 - Loaded Latency: bufferbloat check that captures idle ping baseline, runs LibreSpeed load, measures loaded ping latency/loss/jitter, and reports latency increase under load.
 - Route Health: LibreSpeed load plus gateway, ISP first-hop, and public-target ping health checks to identify whether slowdown starts locally, at the ISP edge, or farther upstream.
 - Wi-Fi Diagnostics: Windows Wi-Fi SSID, BSSID, signal, band, channel, protocol, link rates, security details, and diagnosis for wireless speed limits.
-- Speed Targets: short LibreSpeed comparisons across multiple servers to catch poor server/CDN target selection or routing differences.
+- Speed Targets: selectable short LibreSpeed comparisons across multiple servers to catch poor server/CDN target selection or routing differences.
 
 ## Packaging
 
