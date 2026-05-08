@@ -3,7 +3,7 @@
 ## Next
 
 - Create a PyInstaller build plus installer.
-- Add a Speedtest CLI detection/help flow that points users to Ookla's official installer instead of bundling the CLI binary.
+- Include the bundled LibreSpeed CLI and license files in the PyInstaller/installer output.
 - Extract latency, loss, and jitter calculation into a small testable module.
 - Split the large `PingerApp.py` file into focused modules once behavior is stable.
 

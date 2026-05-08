@@ -2,8 +2,11 @@
 
 ## 2026-05-08
 
-- Reviewed Ookla Speedtest CLI redistribution terms and documented that PingerApp should not bundle the CLI binary by default.
-- Updated packaging notes to prefer detecting an installed Speedtest CLI and guiding users to Ookla's official download page.
+- Reviewed Ookla Speedtest CLI redistribution terms and documented that PingerApp should not bundle the Ookla binary by default.
+- Selected LibreSpeed CLI as the open-source speed test path for future packaged builds.
+- Switched the Speed Test integration from Ookla Speedtest CLI to LibreSpeed CLI using JSON output with telemetry disabled.
+- Updated packaging notes to use `tools/librespeed/librespeed-cli.exe` and include LibreSpeed LGPL-3.0 attribution when bundled.
+- Bundled LibreSpeed CLI v1.0.13 for Windows x64 with its license and checksum record.
 
 ## 2026-05-07
 

@@ -156,7 +156,7 @@ class StartResolveWorker(QThread):
 
 
 class SpeedTestWorker(QThread):
-    """Runs Ookla Speedtest CLI in the background and returns parsed JSON."""
+    """Runs LibreSpeed CLI in the background and returns parsed JSON."""
     result_ready = pyqtSignal(dict)
     error_ready = pyqtSignal(str)
 
@@ -165,7 +165,7 @@ class SpeedTestWorker(QThread):
         self.executable = executable
 
     def run(self):
-        cmd = [self.executable, "--accept-license", "--accept-gdpr", "--format=json"]
+        cmd = [self.executable, "--json", "--telemetry-level", "disabled", "--no-icmp"]
         try:
             kwargs = {
                 "capture_output": True,
@@ -176,31 +176,47 @@ class SpeedTestWorker(QThread):
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             completed = subprocess.run(cmd, **kwargs)
         except FileNotFoundError:
-            self.error_ready.emit("Speedtest CLI executable was not found.")
+            self.error_ready.emit("LibreSpeed CLI executable was not found.")
             return
         except subprocess.TimeoutExpired:
             self.error_ready.emit("Speed test timed out after 180 seconds.")
             return
         except OSError as e:
-            self.error_ready.emit(f"Could not run Speedtest CLI: {e}")
+            self.error_ready.emit(f"Could not run LibreSpeed CLI: {e}")
             return
 
         if completed.returncode != 0:
-            message = (completed.stderr or completed.stdout or "Speedtest CLI failed.").strip()
+            message = (completed.stderr or completed.stdout or "LibreSpeed CLI failed.").strip()
             self.error_ready.emit(message)
             return
 
         output = completed.stdout.strip()
-        start = output.find("{")
-        end = output.rfind("}")
+        object_start = output.find("{")
+        array_start = output.find("[")
+        starts = [pos for pos in (object_start, array_start) if pos != -1]
+        start = min(starts) if starts else -1
+        end = output.rfind("]" if start == array_start else "}")
         if start == -1 or end == -1 or end <= start:
-            self.error_ready.emit("Speedtest CLI did not return JSON output.")
+            self.error_ready.emit("LibreSpeed CLI did not return JSON output.")
             return
 
         try:
-            self.result_ready.emit(json.loads(output[start:end+1]))
+            parsed = json.loads(output[start:end+1])
         except json.JSONDecodeError as e:
-            self.error_ready.emit(f"Could not parse Speedtest JSON: {e}")
+            self.error_ready.emit(f"Could not parse LibreSpeed JSON: {e}")
+            return
+
+        if isinstance(parsed, list):
+            if not parsed:
+                self.error_ready.emit("LibreSpeed CLI returned an empty result list.")
+                return
+            parsed = parsed[0]
+
+        if not isinstance(parsed, dict):
+            self.error_ready.emit("LibreSpeed CLI returned an unsupported JSON shape.")
+            return
+
+        self.result_ready.emit(parsed)
 
 
 class PingerApp(QWidget):
@@ -919,28 +935,28 @@ class PingerApp(QWidget):
         return roots
 
     def _find_speedtest_executable(self):
-        exe_name = "speedtest.exe" if platform.system() == "Windows" else "speedtest"
+        exe_name = "librespeed-cli.exe" if platform.system() == "Windows" else "librespeed-cli"
         for root in self._speedtest_candidate_roots():
             for rel in (
-                os.path.join("tools", "speedtest", exe_name),
+                os.path.join("tools", "librespeed", exe_name),
                 os.path.join("bin", exe_name),
                 exe_name,
             ):
                 candidate = os.path.join(root, rel)
                 if os.path.isfile(candidate):
                     return candidate
-        return shutil.which("speedtest")
+        return shutil.which("librespeed-cli")
 
     def start_speed_test(self):
-        """Run a manual Ookla Speedtest CLI test in the background."""
+        """Run a manual LibreSpeed CLI test in the background."""
         if self.speedtest_worker is not None and self.speedtest_worker.isRunning():
             return
 
         executable = self._find_speedtest_executable()
         if not executable:
             self._set_speedtest_status(
-                "Speedtest CLI not found. Bundle it at tools/speedtest/speedtest.exe "
-                "or install Ookla Speedtest CLI so 'speedtest' is available on PATH."
+                "LibreSpeed CLI not found. Put librespeed-cli.exe in tools/librespeed "
+                "or install librespeed-cli so it is available on PATH."
             )
             return
 
@@ -957,7 +973,7 @@ class PingerApp(QWidget):
     def _set_speedtest_status(self, message: str):
         if self.speedtest_status_label is not None:
             self.speedtest_status_label.setText(message)
-            if message.startswith("Speed test failed") or message.startswith("Speedtest CLI not found"):
+            if message.startswith("Speed test failed") or message.startswith("LibreSpeed CLI not found"):
                 style = (
                     "QLabel { background: #fce8e6; color: #a50e0e; border: 1px solid #d28b82; "
                     "border-radius: 4px; padding: 8px; font-weight: bold; }"
@@ -979,33 +995,42 @@ class PingerApp(QWidget):
                 )
             self.speedtest_status_label.setStyleSheet(style)
 
-    def _format_bandwidth_mbps(self, value):
+    def _format_mbps(self, value):
         if value is None:
             return "N/A"
-        return f"{(float(value) * 8 / 1_000_000):.2f} Mbps"
+        return f"{(float(value) / 1_000_000):.2f} Mbps"
+
+    def _dict_get_any(self, data: dict, *keys):
+        for key in keys:
+            if key in data and data[key] not in (None, ""):
+                return data[key]
+        return None
 
     def _set_speedtest_result(self, data: dict):
-        ping = data.get("ping", {}) or {}
-        download = data.get("download", {}) or {}
-        upload = data.get("upload", {}) or {}
         server = data.get("server", {}) or {}
-        interface = data.get("interface", {}) or {}
-        result = data.get("result", {}) or {}
+        client = data.get("client", {}) or {}
 
-        server_parts = [server.get("name"), server.get("location"), server.get("country")]
+        server_parts = [
+            self._dict_get_any(server, "name", "Name"),
+            self._dict_get_any(server, "sponsorName", "sponsor", "Sponsor"),
+            self._dict_get_any(server, "server", "url", "URL"),
+        ]
         server_text = ", ".join(part for part in server_parts if part) or "N/A"
-        isp = data.get("isp") or interface.get("externalIp") or "N/A"
-        packet_loss = data.get("packetLoss")
+        isp = (
+            self._dict_get_any(client, "isp", "ISP", "org", "Org")
+            or self._dict_get_any(client, "ip", "IP")
+            or "N/A"
+        )
 
         values = {
-            "download": self._format_bandwidth_mbps(download.get("bandwidth")),
-            "upload": self._format_bandwidth_mbps(upload.get("bandwidth")),
-            "latency": "N/A" if ping.get("latency") is None else f"{float(ping.get('latency')):.1f} ms",
-            "jitter": "N/A" if ping.get("jitter") is None else f"{float(ping.get('jitter')):.1f} ms",
-            "loss": "N/A" if packet_loss is None else f"{float(packet_loss):.1f}%",
+            "download": self._format_mbps(data.get("download")),
+            "upload": self._format_mbps(data.get("upload")),
+            "latency": "N/A" if data.get("ping") is None else f"{float(data.get('ping')):.1f} ms",
+            "jitter": "N/A" if data.get("jitter") is None else f"{float(data.get('jitter')):.1f} ms",
+            "loss": "N/A (not reported by LibreSpeed)",
             "server": server_text,
             "isp": isp,
-            "result": result.get("url") or "N/A",
+            "result": data.get("share") or "N/A",
         }
 
         for key, value in values.items():

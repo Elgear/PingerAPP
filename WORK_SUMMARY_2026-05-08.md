@@ -15,9 +15,12 @@
 - Added Default buttons for alert thresholds and history.
 - Changed alert behavior from popups to an Alert Log window.
 - Updated Alert Log behavior so every breached ping sample is recorded while its alert toggle is enabled.
-- Added a separate Speed Test window using optional Ookla Speedtest CLI JSON output.
+- Added a separate Speed Test window using optional CLI JSON output.
 - Restyled the Speed Test window and fixed its initial sizing.
-- Added documentation for expected bundled Speedtest CLI location: `tools/speedtest/speedtest.exe`.
+- Added documentation for expected bundled LibreSpeed CLI location: `tools/librespeed/librespeed-cli.exe`.
+- Reviewed Ookla Speedtest CLI redistribution terms and switched the planned packaged integration to LibreSpeed CLI.
+- Updated the Speed Test worker to call LibreSpeed CLI JSON output with telemetry disabled.
+- Bundled LibreSpeed CLI v1.0.13 for Windows x64 with checksum and LGPL-3.0 attribution notes.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
@@ -29,7 +32,7 @@
 - Traceroute uses the current Host field and shows a target label.
 - Alert Log opens in a separate window from the right-side Alert Log button.
 - Speed Test opens in a separate window from the top Ping Panel button.
-- Speed Test requires Ookla CLI either bundled at `tools/speedtest/speedtest.exe` or available as `speedtest` on PATH.
+- Speed Test uses the bundled LibreSpeed CLI at `tools/librespeed/librespeed-cli.exe`, with `librespeed-cli` on PATH as a fallback.
 
 ## Verification Used
 
@@ -44,7 +47,7 @@ python -m py_compile PingerApp\PingerApp.py check_qt.py
 
 ## Open Decisions
 
-- Confirm whether Ookla Speedtest CLI can be redistributed with PingerApp under its EULA.
+- Make sure the bundled LibreSpeed CLI and license files are included in the installer.
 - Decide installer approach for Windows PCs.
 - Decide whether the app should require administrator privileges for raw ICMP ping or use another ping backend.
 
@@ -52,7 +55,7 @@ python -m py_compile PingerApp\PingerApp.py check_qt.py
 
 - Create a PyInstaller build configuration.
 - Test a packaged build on a clean Windows PC.
-- Decide whether to include `tools/speedtest/speedtest.exe` in the installer after license review.
+- Add the bundled LibreSpeed CLI and license files to the installer.
 - Split the large `PingerApp.py` file into focused modules once layout and behavior settle.
 - Extract latency, loss, jitter, health, and alert calculations into testable functions.
 - Add saved host presets.

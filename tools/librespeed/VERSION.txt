@@ -1,0 +1,4 @@
+librespeed-cli 1.0.13
+Source: https://github.com/librespeed/speedtest-cli/releases/tag/v1.0.13
+Asset: librespeed-cli_1.0.13_windows_amd64.zip
+SHA256: 0D10A38858A05998FE1AF070CA3C98E6DC038C0883B22C18918B33C855789F2A
