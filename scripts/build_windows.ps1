@@ -1,5 +1,5 @@
 param(
-    [string]$Python = ".\venv\Scripts\python.exe",
+    [string]$Python = ".\.packaging-venv\Scripts\python.exe",
     [switch]$Clean
 )
 

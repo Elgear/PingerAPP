@@ -8,6 +8,7 @@ __pycache__/
 PingerApp/.vs/
 
 .venv/
+.packaging-venv/
 venv/
 PingerApp/env/
 

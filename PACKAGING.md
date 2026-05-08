@@ -1,6 +1,22 @@
 # Packaging
 
-PingerApp uses PyInstaller for the first Windows distributable build.
+PingerApp uses PyInstaller for the Windows distributable build.
+
+Build from the dedicated `.packaging-venv` environment. This avoids prerelease Python environments that can produce a broken PyQt/SIP frozen app.
+
+## Packaging Environment
+
+Create or refresh the packaging environment from stable Python 3.13:
+
+```powershell
+.\scripts\setup_packaging_env.ps1
+```
+
+The default Python path is `C:\Python313\python.exe`. To use another stable Python install:
+
+```powershell
+.\scripts\setup_packaging_env.ps1 -Python "C:\Path\To\python.exe"
+```
 
 ## Build
 
@@ -10,13 +26,13 @@ Use the repository root as the working directory:
 .\scripts\build_windows.ps1 -Clean
 ```
 
-The script uses `.\venv\Scripts\python.exe` by default because that local environment currently has PyInstaller available. To use another environment:
+The script uses `.\.packaging-venv\Scripts\python.exe` by default. To use another environment:
 
 ```powershell
-.\scripts\build_windows.ps1 -Python .\PingerApp\env\Scripts\python.exe -Clean
+.\scripts\build_windows.ps1 -Python C:\Path\To\python.exe -Clean
 ```
 
-That environment must have PyInstaller plus the app dependencies from `requirements.txt`.
+That environment must have PyInstaller plus the app dependencies from `requirements.txt`. Avoid the old root `venv` and `PingerApp\env` prerelease Python environments for packaging.
 
 ## Output
 
@@ -106,10 +122,10 @@ The installer output is written to:
 installer_output\PingerAppSetup-0.1.0.exe
 ```
 
-The local installer build has been verified with Inno Setup 6.7.1. The latest generated installer hash was:
+The local installer build has been verified with Inno Setup 6.7.1. The latest generated installer was built from Python 3.13.7 and has this hash:
 
 ```text
-SHA256 D6DEBCC685E6B1DA27A2B6766FE65D0F19DC20AE87369F42DDB6DCCDECAA3AB1
+SHA256 AEB4E2AA445462D2B1FC93906DD5321AFD40D8A458C84D4A8DFA33F2BFDD9564
 ```
 
 The installer copies the full `dist\PingerApp` folder, adds a Start Menu shortcut, offers an optional desktop shortcut, and copies `README.md` plus `THIRD_PARTY_NOTICES.md` to the install root.

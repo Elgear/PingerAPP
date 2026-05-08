@@ -60,6 +60,8 @@
 - Added Report CSV export with structured rows for Speed Test history, Speed Targets, traceroute hops, and Network Scanner results.
 - Installed Inno Setup 6.7.1 locally, generated `installer_output\PingerAppSetup-0.1.0.exe`, and smoke-tested the packaged EXE.
 - Updated the installer wrapper to find winget's per-user Inno Setup install location and moved the Inno architecture identifier to `x64compatible`.
+- Fixed the packaged app PyQt/SIP startup crash by moving packaging to a dedicated stable Python 3.13 environment.
+- Added a packaging environment setup script and rebuilt `installer_output\PingerAppSetup-0.1.0.exe` from the corrected PyInstaller output.
 
 ## 2026-05-07
 

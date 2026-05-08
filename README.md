@@ -68,12 +68,11 @@ The bundled Windows build is iperf3 3.21 and includes `cygwin1.dll`. Source, lic
 For a local Windows build, use the PyInstaller wrapper script:
 
 ```powershell
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+.\scripts\setup_packaging_env.ps1
 .\scripts\build_windows.ps1 -Clean
 ```
 
-The build output is written to `dist\PingerApp\PingerApp.exe`. Full packaging notes are in `PACKAGING.md`.
+The build output is written to `dist\PingerApp\PingerApp.exe`. Full packaging notes are in `PACKAGING.md`. Packaging should use the dedicated `.packaging-venv` created from stable Python 3.13; do not build the release installer from the older prerelease virtual environments.
 
 For a PC install, build the PyInstaller output and then run the Inno Setup wrapper:
 

@@ -67,7 +67,8 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 - Build includes bundled `tools/iperf3/iperf3.exe`, `tools/iperf3/cygwin1.dll`, and related license files.
 - Inno Setup installer script and build wrapper are in place.
 - Local Inno Setup installer build has been generated successfully.
-- Packaged EXE has been smoke-tested after the latest build.
+- Packaged EXE has been smoke-tested after the latest Python 3.13 build.
+- PyQt/SIP startup crash from prerelease Python packaging environments has been fixed.
 - Test the Inno Setup installer on a clean Windows PC or VM.
 
 ## Refactor Plan
