@@ -18,7 +18,9 @@ Host Info includes local hostname, local IP, first-hop gateway, public IP, publi
 The right-side Tools panel opens separate diagnostic windows:
 
 - Speed Test: LibreSpeed-based internet speed test with persistent history.
-- Network Scanner: safe TCP connect scanning for one host or an IPv4 subnet, with explicit Single host/Subnet controls, common CIDR size selection, stop control, result filtering, highlighted open/live rows, host discovery, full-port/specific-port presets, open/closed/filtered state reporting, service names, optional light service probes, progress, latency, MAC lookup where available, and error details.
+- Network Scanner: safe TCP connect scanning for one host or an IPv4 subnet, with explicit Single host/Subnet controls, common CIDR size selection, stop control, grouped-by-host results, result filtering, highlighted open/live rows, host discovery, full-port/specific-port presets, open/closed/filtered state reporting, service names, optional light service probes, progress, latency, and hostname/MAC lookup through reverse DNS, ARP, and Windows NetBIOS where available.
+
+MAC addresses can only be discovered when the target exposes them on the local network path. Routed hosts usually show no MAC address, or only the next-hop device in the local ARP cache.
 - DNS / WHOIS: forward/reverse lookup, selectable DNS record lookup through `nslookup`, and optional IP/ASN/ISP ownership metadata.
 - Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
 - Alerts: threshold alert log.

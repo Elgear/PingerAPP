@@ -30,7 +30,8 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QGroupBox, QSlider, QTextEdit,
-    QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox, QProgressBar
+    QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox, QProgressBar,
+    QTreeWidget, QTreeWidgetItem, QToolButton, QToolTip
 )
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -103,7 +104,7 @@ def get_arp_mac(ip):
     if platform.system() != "Windows":
         return "N/A"
     try:
-        kwargs = {"text": True, "timeout": 3}
+        kwargs = {"text": True, "timeout": 1.5}
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         out = subprocess.check_output(["arp", "-a", str(ip)], **kwargs)
@@ -113,6 +114,33 @@ def get_arp_mac(ip):
     pattern = re.compile(rf"\b{re.escape(str(ip))}\b\s+([0-9a-fA-F-]{{17}})")
     match = pattern.search(out)
     return match.group(1).replace("-", ":").upper() if match else "N/A"
+
+def get_windows_netbios_info(ip):
+    """Return NetBIOS hostname/MAC when the Windows target exposes it."""
+    if platform.system() != "Windows":
+        return {"hostname": "N/A", "mac": "N/A"}
+    try:
+        kwargs = {"capture_output": True, "text": True, "timeout": 1.5}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        completed = subprocess.run(["nbtstat", "-A", str(ip)], **kwargs)
+    except Exception:
+        return {"hostname": "N/A", "mac": "N/A"}
+
+    output = (completed.stdout or completed.stderr or "")
+    hostname = "N/A"
+    for line in output.splitlines():
+        if "<00>" in line and "UNIQUE" in line.upper():
+            candidate = line.split("<00>", 1)[0].strip()
+            if candidate and candidate.upper() not in {"WORKGROUP", "MSHOME"}:
+                hostname = candidate
+                break
+
+    mac = "N/A"
+    match = re.search(r"MAC Address\s*=\s*([0-9A-Fa-f:-]{17})", output)
+    if match:
+        mac = match.group(1).replace("-", ":").upper()
+    return {"hostname": hostname, "mac": mac}
 
 def classify_connect_error(code):
     refused_codes = {
@@ -406,6 +434,16 @@ class PortCheckWorker(QThread):
         except (socket.herror, OSError):
             return "N/A"
 
+    def _host_identity(self, host):
+        reverse_name = self._reverse_name(host)
+        arp_mac = get_arp_mac(host)
+        netbios = {"hostname": "N/A", "mac": "N/A"}
+        if reverse_name == "N/A" or arp_mac == "N/A":
+            netbios = get_windows_netbios_info(host)
+        hostname = first_available(reverse_name, netbios.get("hostname"))
+        mac = first_available(arp_mac, netbios.get("mac"))
+        return {"hostname": hostname, "mac": mac}
+
     def _tcp_probe(self, host, port, timeout_seconds, include_probe=False):
         started = time.perf_counter()
         latency = None
@@ -474,15 +512,16 @@ class PortCheckWorker(QThread):
 
         reasons.extend(open_or_refused)
         alive = bool(reasons)
+        identity = self._host_identity(host) if alive else {"hostname": "N/A", "mac": "N/A"}
         return {
             "host": host,
-            "hostname": self._reverse_name(host),
+            "hostname": identity["hostname"],
             "port": "",
             "service": "",
             "status": "Host Up" if alive else "No Response",
             "latency": latency,
             "error": ", ".join(reasons) if reasons else "No ICMP or TCP discovery response",
-            "mac": get_arp_mac(host) if alive else "N/A",
+            "mac": identity["mac"],
             "alive": alive,
         }
 
@@ -492,6 +531,7 @@ class PortCheckWorker(QThread):
         total = len(self.ports) if len(self.targets) == 1 else len(self.targets)
 
         live_targets = list(self.targets)
+        live_host_info = {}
         if len(self.targets) > 1:
             live_targets = []
             target_iter = iter(self.targets)
@@ -518,6 +558,7 @@ class PortCheckWorker(QThread):
                         completed += 1
                         if result.get("alive"):
                             live_targets.append(result["host"])
+                            live_host_info[result["host"]] = result
                             self.host_ready.emit(result)
                         self.progress_ready.emit(completed, total)
                     submit_discovery()
@@ -532,7 +573,12 @@ class PortCheckWorker(QThread):
         if not live_targets:
             return
 
-        single_hostname = self._reverse_name(live_targets[0]) if len(live_targets) == 1 else "N/A"
+        if len(live_targets) == 1 and not live_host_info:
+            identity = self._host_identity(live_targets[0])
+            live_host_info[live_targets[0]] = {
+                "hostname": identity["hostname"],
+                "mac": identity["mac"],
+            }
         job_iter = ((target, port) for target in live_targets for port in self.ports)
         pending = set()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
@@ -554,7 +600,9 @@ class PortCheckWorker(QThread):
                 )
                 for future in done:
                     result = future.result()
-                    result["hostname"] = single_hostname
+                    identity = live_host_info.get(result["host"], {})
+                    result["hostname"] = identity.get("hostname", "N/A")
+                    result["mac"] = identity.get("mac", "N/A")
                     self.result_ready.emit(result)
                     completed += 1
                     self.progress_ready.emit(completed, total)
@@ -806,6 +854,9 @@ class PingerApp(QWidget):
         self.port_progress_bar = None
         self.port_help_label = None
         self.port_scan_results = []
+        self.port_host_items = {}
+        self.port_host_summaries = {}
+        self.port_scan_seen_hosts = set()
         self.port_scan_result_count = 0
         self.port_scan_open_count = 0
         self.port_scan_filtered_count = 0
@@ -1398,6 +1449,27 @@ class PingerApp(QWidget):
             f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 3px; padding: 2px 4px; }}"
         )
 
+    def _help_label(self, text: str, help_text: str):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+        label = QLabel(text)
+        button = QToolButton()
+        button.setText("?")
+        button.setFixedSize(18, 18)
+        button.setAutoRaise(True)
+        button.setToolTip(help_text)
+        button.clicked.connect(
+            lambda checked=False, btn=button, msg=help_text: QToolTip.showText(
+                btn.mapToGlobal(btn.rect().bottomLeft()), msg, btn
+            )
+        )
+        layout.addWidget(label)
+        layout.addWidget(button)
+        layout.addStretch(1)
+        return widget
+
     def show_port_check_window(self):
         """Open the Network Scanner diagnostic window."""
         if self.port_window is None:
@@ -1482,19 +1554,19 @@ class PingerApp(QWidget):
             self.port_service_probe_check = QCheckBox("Probe service banners")
             self.port_service_probe_check.setToolTip("Best-effort banner, HTTP header, and TLS handshake checks on open ports.")
 
-            controls.addWidget(QLabel("Host"), 0, 0)
+            controls.addWidget(self._help_label("Host", "Enter a hostname, IP address, or network base IP. For subnet scans, 172.16.10.1 with /24 scans 172.16.10.0/24."), 0, 0)
             controls.addWidget(self.port_host_input, 0, 1)
-            controls.addWidget(QLabel("Target"), 0, 2)
+            controls.addWidget(self._help_label("Target", "Single host scans one device. Subnet discovers live devices in the selected CIDR range, then scans ports on live hosts."), 0, 2)
             controls.addWidget(self.port_target_mode_combo, 0, 3)
-            controls.addWidget(QLabel("Subnet"), 0, 4)
+            controls.addWidget(self._help_label("Subnet", "CIDR subnet size. /24 is 256 addresses, /23 is 512. Larger ranges are blocked to keep scans controlled."), 0, 4)
             controls.addWidget(self.port_subnet_combo, 0, 5)
-            controls.addWidget(QLabel("Port(s)"), 1, 0)
+            controls.addWidget(self._help_label("Port(s)", "Choose a preset or enter ports/ranges such as 80,443,8000-8010. Full 1-65535 scans are single-host only."), 1, 0)
             controls.addWidget(self.port_ports_combo, 1, 1, 1, 5)
-            controls.addWidget(QLabel("Timeout"), 2, 0)
+            controls.addWidget(self._help_label("Timeout", "Maximum wait time for each TCP probe before treating it as filtered, dropped, or unreachable."), 2, 0)
             controls.addWidget(self.port_timeout_spin, 2, 1)
-            controls.addWidget(QLabel("Parallel probes"), 2, 2)
+            controls.addWidget(self._help_label("Parallel probes", "How many connection attempts run at the same time. Lower is gentler; higher is faster but noisier."), 2, 2)
             controls.addWidget(self.port_concurrency_spin, 2, 3)
-            controls.addWidget(QLabel("Filter"), 2, 4)
+            controls.addWidget(self._help_label("Filter", "Controls which result rows are visible. Open/live filters are useful after large subnet scans."), 2, 4)
             controls.addWidget(self.port_filter_combo, 2, 5)
             controls.addWidget(self.port_service_probe_check, 3, 1, 1, 2)
             controls.addWidget(self.port_run_btn, 3, 4)
@@ -1502,16 +1574,6 @@ class PingerApp(QWidget):
             controls.setColumnStretch(1, 1)
             layout.addLayout(controls)
 
-            self.port_help_label = QLabel(
-                "Single host scans one target. Subnet combines Host with the selected CIDR size. "
-                "Parallel probes are simultaneous connection attempts; lower is gentler, higher is faster."
-            )
-            self.port_help_label.setWordWrap(True)
-            self.port_help_label.setStyleSheet(
-                "QLabel { color: #3c4043; background: #f8f9fa; border: 1px solid #d5dce5; "
-                "border-radius: 4px; padding: 6px; }"
-            )
-            layout.addWidget(self.port_help_label)
             self._update_port_target_controls()
 
             self.port_status_label = QLabel("Ready")
@@ -1528,12 +1590,14 @@ class PingerApp(QWidget):
             self.port_progress_bar.setFormat("Ready")
             layout.addWidget(self.port_progress_bar)
 
-            self.port_table = QTableWidget(0, 8)
-            self.port_table.setHorizontalHeaderLabels(["Host", "Hostname", "Port", "Service", "State", "Latency", "MAC", "Details"])
-            self.port_table.verticalHeader().setVisible(False)
-            self.port_table.setEditTriggers(QTableWidget.NoEditTriggers)
-            self.port_table.setSelectionBehavior(QTableWidget.SelectRows)
-            ph = self.port_table.horizontalHeader()
+            self.port_table = QTreeWidget()
+            self.port_table.setColumnCount(8)
+            self.port_table.setHeaderLabels(["Host", "Hostname", "Port", "Service", "State", "Latency", "MAC", "Details"])
+            self.port_table.setRootIsDecorated(True)
+            self.port_table.setAlternatingRowColors(True)
+            self.port_table.setSelectionBehavior(QTreeWidget.SelectRows)
+            self.port_table.setUniformRowHeights(True)
+            ph = self.port_table.header()
             ph.setSectionResizeMode(0, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(1, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -1654,8 +1718,12 @@ class PingerApp(QWidget):
         timeout_ms = self.port_timeout_spin.value() if self.port_timeout_spin is not None else 3000
         max_workers = self.port_concurrency_spin.value() if self.port_concurrency_spin is not None else 64
         detect_services = self.port_service_probe_check is not None and self.port_service_probe_check.isChecked()
-        self.port_table.setRowCount(0)
+        self.port_table.clear()
+        self.port_table.setHeaderLabels(["Host", "Hostname", "Port", "Service", "State", "Latency", "MAC", "Details"])
         self.port_scan_results = []
+        self.port_host_items = {}
+        self.port_host_summaries = {}
+        self.port_scan_seen_hosts = set()
         self.port_scan_result_count = 0
         self.port_scan_open_count = 0
         self.port_scan_filtered_count = 0
@@ -1708,9 +1776,14 @@ class PingerApp(QWidget):
         if self.port_table is None:
             return
         status = result.get("status", "")
-        if status == "Host Up":
+        host = result.get("host", "")
+        if status == "Host Up" and host not in self.port_scan_seen_hosts:
+            self.port_scan_seen_hosts.add(host)
             self.port_scan_host_count += 1
-        else:
+        elif status in {"Open", "Closed"} and host not in self.port_scan_seen_hosts:
+            self.port_scan_seen_hosts.add(host)
+            self.port_scan_host_count += 1
+        if status != "Host Up":
             self.port_scan_result_count += 1
         if status == "Open":
             self.port_scan_open_count += 1
@@ -1743,26 +1816,30 @@ class PingerApp(QWidget):
     def _refresh_port_table(self, *args):
         if self.port_table is None:
             return
-        self.port_table.setRowCount(0)
+        self.port_table.clear()
+        self.port_table.setHeaderLabels(["Host", "Hostname", "Port", "Service", "State", "Latency", "MAC", "Details"])
+        self.port_host_items = {}
+        self.port_host_summaries = {}
         for result in self.port_scan_results:
             if self._port_result_visible(result):
                 self._insert_port_result(result)
 
-    def _insert_port_result(self, result: dict):
-        status = result.get("status", "")
-        latency = "N/A" if result.get("latency") is None else f"{result['latency']:.1f} ms"
-        row_values = [
-            result.get("host", ""),
-            result.get("hostname", "N/A"),
-            str(result.get("port", "")),
-            result.get("service", ""),
-            status,
-            latency,
-            result.get("mac", "N/A"),
-            result.get("error", ""),
-        ]
-        row = self.port_table.rowCount()
-        self.port_table.insertRow(row)
+    def _blank_host_summary(self, result):
+        return {
+            "host": result.get("host", ""),
+            "hostname": result.get("hostname", "N/A"),
+            "mac": result.get("mac", "N/A"),
+            "alive": False,
+            "open": 0,
+            "closed": 0,
+            "filtered": 0,
+            "unreachable": 0,
+            "other": 0,
+            "latency": None,
+            "details": "",
+        }
+
+    def _apply_tree_item_style(self, item, status):
         row_background = None
         if status == "Open":
             row_background = QBrush(QColor("#dff3e6"))
@@ -1772,11 +1849,93 @@ class PingerApp(QWidget):
             row_background = QBrush(QColor("#fff4ce"))
         elif status in {"Closed", "No Response"}:
             row_background = QBrush(QColor("#f8d7da"))
-        for col, value in enumerate(row_values):
-            item = QTableWidgetItem(value)
-            if row_background is not None:
-                item.setBackground(row_background)
-            self.port_table.setItem(row, col, item)
+        if row_background is not None:
+            for col in range(8):
+                item.setBackground(col, row_background)
+
+    def _update_host_summary_item(self, host):
+        item = self.port_host_items.get(host)
+        summary = self.port_host_summaries.get(host)
+        if item is None or summary is None:
+            return
+        scanned = summary["open"] + summary["closed"] + summary["filtered"] + summary["unreachable"] + summary["other"]
+        state_parts = []
+        if summary["alive"]:
+            state_parts.append("Host Up")
+        if scanned:
+            state_parts.append(f"{summary['open']}/{scanned} open")
+        state = ", ".join(state_parts) or "Host"
+        latency = "N/A" if summary["latency"] is None else f"{summary['latency']:.1f} ms"
+        item.setText(0, host)
+        item.setText(1, summary["hostname"])
+        item.setText(2, "")
+        item.setText(3, "")
+        item.setText(4, state)
+        item.setText(5, latency)
+        item.setText(6, summary["mac"])
+        item.setText(7, summary["details"])
+        if summary["open"]:
+            self._apply_tree_item_style(item, "Open")
+        elif summary["alive"]:
+            self._apply_tree_item_style(item, "Host Up")
+        elif summary["filtered"] and not summary["closed"]:
+            self._apply_tree_item_style(item, "Filtered")
+        elif summary["closed"]:
+            self._apply_tree_item_style(item, "Closed")
+
+    def _get_host_item(self, result):
+        host = result.get("host", "")
+        if host in self.port_host_items:
+            return self.port_host_items[host]
+        item = QTreeWidgetItem(["", "", "", "", "", "", "", ""])
+        self.port_table.addTopLevelItem(item)
+        self.port_host_items[host] = item
+        self.port_host_summaries[host] = self._blank_host_summary(result)
+        self._update_host_summary_item(host)
+        item.setExpanded(True)
+        return item
+
+    def _insert_port_result(self, result: dict):
+        status = result.get("status", "")
+        latency = "N/A" if result.get("latency") is None else f"{result['latency']:.1f} ms"
+        host_item = self._get_host_item(result)
+        summary = self.port_host_summaries[result.get("host", "")]
+        summary["hostname"] = first_available(result.get("hostname"), summary["hostname"])
+        summary["mac"] = first_available(result.get("mac"), summary["mac"])
+        if result.get("latency") is not None and summary["latency"] is None:
+            summary["latency"] = result.get("latency")
+        if status == "Host Up":
+            summary["alive"] = True
+            summary["details"] = result.get("error", "")
+            self._update_host_summary_item(result.get("host", ""))
+            return
+
+        if status == "Open":
+            summary["alive"] = True
+            summary["open"] += 1
+        elif status == "Closed":
+            summary["alive"] = True
+            summary["closed"] += 1
+        elif status == "Filtered":
+            summary["filtered"] += 1
+        elif status == "Unreachable":
+            summary["unreachable"] += 1
+        else:
+            summary["other"] += 1
+
+        child = QTreeWidgetItem([
+            "",
+            "",
+            str(result.get("port", "")),
+            result.get("service", ""),
+            status,
+            latency,
+            "",
+            result.get("error", ""),
+        ])
+        self._apply_tree_item_style(child, status)
+        host_item.addChild(child)
+        self._update_host_summary_item(result.get("host", ""))
 
     def _update_port_scan_progress(self, completed: int, total: int):
         if self.port_progress_bar is None:
