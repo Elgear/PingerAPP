@@ -15,6 +15,10 @@ import os
 import shutil
 import time
 import uuid
+import errno
+import ipaddress
+import concurrent.futures
+import ssl
 
 from collections import deque
 from datetime import datetime
@@ -89,6 +93,95 @@ def service_name(port):
         return socket.getservbyport(int(port), "tcp")
     except OSError:
         return "unknown"
+
+def clean_probe_text(value, max_len=220):
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", value or "")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:max_len]
+
+def get_arp_mac(ip):
+    if platform.system() != "Windows":
+        return "N/A"
+    try:
+        kwargs = {"text": True, "timeout": 3}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        out = subprocess.check_output(["arp", "-a", str(ip)], **kwargs)
+    except Exception:
+        return "N/A"
+
+    pattern = re.compile(rf"\b{re.escape(str(ip))}\b\s+([0-9a-fA-F-]{{17}})")
+    match = pattern.search(out)
+    return match.group(1).replace("-", ":").upper() if match else "N/A"
+
+def classify_connect_error(code):
+    refused_codes = {
+        errno.ECONNREFUSED,
+        getattr(errno, "WSAECONNREFUSED", 10061),
+        10061,
+    }
+    timeout_codes = {
+        errno.ETIMEDOUT,
+        getattr(errno, "WSAETIMEDOUT", 10060),
+        10060,
+    }
+    unreachable_codes = {
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        getattr(errno, "WSAENETUNREACH", 10051),
+        getattr(errno, "WSAEHOSTUNREACH", 10065),
+        10051,
+        10065,
+    }
+    if code in refused_codes:
+        return "Closed", "Connection refused"
+    if code in timeout_codes:
+        return "Filtered", "Timed out / dropped"
+    if code in unreachable_codes:
+        return "Unreachable", "Network or host unreachable"
+    return "Error", os.strerror(code) if code else "Unknown socket error"
+
+def probe_open_service(host, port, timeout_seconds):
+    """Best-effort, light service probe for already-open TCP ports."""
+    timeout_seconds = max(0.3, min(timeout_seconds, 3.0))
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
+            sock.settimeout(timeout_seconds)
+            if port in {443, 8443, 9443, 465, 993, 995}:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+                    if port in {443, 8443, 9443}:
+                        tls_sock.sendall(
+                            f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode("ascii", "ignore")
+                        )
+                        data = tls_sock.recv(2048).decode("utf-8", "replace")
+                        lines = [line.strip() for line in data.splitlines() if line.strip()]
+                        details = lines[:1]
+                        details.extend(line for line in lines if line.lower().startswith("server:"))
+                        return clean_probe_text(" | ".join(details)) or "TLS service responded"
+                    return "TLS handshake succeeded"
+
+            if port in {80, 8000, 8080, 8081, 8888}:
+                sock.sendall(
+                    f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode("ascii", "ignore")
+                )
+                data = sock.recv(2048).decode("utf-8", "replace")
+                lines = [line.strip() for line in data.splitlines() if line.strip()]
+                details = lines[:1]
+                details.extend(line for line in lines if line.lower().startswith("server:"))
+                return clean_probe_text(" | ".join(details)) or "HTTP service responded"
+
+            try:
+                data = sock.recv(1024)
+                if data:
+                    return clean_probe_text(data.decode("utf-8", "replace"))
+            except socket.timeout:
+                pass
+            return "Open; no banner"
+    except Exception as e:
+        return f"Probe failed: {clean_probe_text(str(e), 160)}"
 
 def get_default_gateway():
     """Return LAN gateway by parsing system route tables."""
@@ -281,41 +374,143 @@ class DnsWhoisWorker(QThread):
 
 
 class PortCheckWorker(QThread):
-    """Checks TCP connectivity for one or more ports without blocking the UI."""
+    """Runs safe TCP network discovery and port scanning without blocking the UI."""
     result_ready = pyqtSignal(dict)
     progress_ready = pyqtSignal(int, int)
+    host_ready = pyqtSignal(dict)
 
-    def __init__(self, host: str, ports: list, timeout_ms=3000):
+    def __init__(self, host: str, targets: list, ports: list, timeout_ms=3000, detect_services=False, max_workers=64):
         super().__init__()
         self.host = host
+        self.targets = targets
         self.ports = ports
         self.timeout_ms = timeout_ms
+        self.detect_services = detect_services
+        self.max_workers = max(1, min(int(max_workers), 256))
+        self.discovery_ports = [80, 443, 22, 445, 3389]
+
+    def _reverse_name(self, host):
+        try:
+            return socket.gethostbyaddr(str(host))[0]
+        except (socket.herror, OSError):
+            return "N/A"
+
+    def _tcp_probe(self, host, port, timeout_seconds, include_probe=False):
+        started = time.perf_counter()
+        latency = None
+        detail = ""
+        status = "Closed"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout_seconds)
+            code = sock.connect_ex((str(host), int(port)))
+            latency = (time.perf_counter() - started) * 1000
+            if code == 0:
+                status = "Open"
+                detail = probe_open_service(str(host), int(port), timeout_seconds) if include_probe else ""
+            else:
+                status, detail = classify_connect_error(code)
+                if status in {"Filtered", "Unreachable"}:
+                    latency = None
+        except socket.timeout:
+            status = "Filtered"
+            detail = "Timed out / dropped"
+            latency = None
+        except OSError as e:
+            status, detail = classify_connect_error(getattr(e, "errno", None))
+            if not detail or detail == "Unknown socket error":
+                detail = str(e)
+            latency = None
+        finally:
+            sock.close()
+
+        return {
+            "host": str(host),
+            "hostname": "N/A",
+            "port": int(port),
+            "service": service_name(port),
+            "status": status,
+            "latency": latency,
+            "error": detail,
+        }
+
+    def _discover_host(self, host, timeout_seconds):
+        host = str(host)
+        reasons = []
+        latency = None
+        ping_latency = None
+        try:
+            ping_latency = ping3.ping(host, timeout=min(1, timeout_seconds), unit="ms")
+        except Exception:
+            ping_latency = None
+        if ping_latency is not None:
+            latency = ping_latency
+            reasons.append("ICMP reply")
+
+        open_or_refused = []
+        for port in self.discovery_ports:
+            result = self._tcp_probe(host, port, min(timeout_seconds, 1.0), include_probe=False)
+            if result["status"] == "Open":
+                open_or_refused.append(f"{port}/tcp open")
+                if latency is None:
+                    latency = result.get("latency")
+                break
+            if result["status"] == "Closed":
+                open_or_refused.append(f"{port}/tcp refused")
+                if latency is None:
+                    latency = result.get("latency")
+                break
+
+        reasons.extend(open_or_refused)
+        alive = bool(reasons)
+        return {
+            "host": host,
+            "hostname": self._reverse_name(host),
+            "port": "",
+            "service": "",
+            "status": "Host Up" if alive else "No Response",
+            "latency": latency,
+            "error": ", ".join(reasons) if reasons else "No ICMP or TCP discovery response",
+            "mac": get_arp_mac(host) if alive else "N/A",
+            "alive": alive,
+        }
 
     def run(self):
         timeout_seconds = max(0.1, self.timeout_ms / 1000)
-        for index, port in enumerate(self.ports, start=1):
-            started = time.perf_counter()
-            status = "Closed"
-            error = ""
-            latency = None
-            try:
-                with socket.create_connection((self.host, port), timeout=timeout_seconds):
-                    latency = (time.perf_counter() - started) * 1000
-                    status = "Open"
-            except socket.timeout:
-                error = "Timed out"
-            except OSError as e:
-                error = str(e)
+        completed = 0
+        total = len(self.ports) if len(self.targets) == 1 else len(self.targets)
 
-            self.result_ready.emit({
-                "host": self.host,
-                "port": port,
-                "service": service_name(port),
-                "status": status,
-                "latency": latency,
-                "error": error,
-            })
-            self.progress_ready.emit(index, len(self.ports))
+        live_targets = list(self.targets)
+        if len(self.targets) > 1:
+            live_targets = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.targets))) as executor:
+                futures = [executor.submit(self._discover_host, target, timeout_seconds) for target in self.targets]
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    completed += 1
+                    if result.get("alive"):
+                        live_targets.append(result["host"])
+                        self.host_ready.emit(result)
+                    self.progress_ready.emit(completed, total)
+            total = completed + (len(live_targets) * len(self.ports))
+            self.progress_ready.emit(completed, total)
+
+        scan_jobs = [(target, port) for target in live_targets for port in self.ports]
+        if not scan_jobs:
+            return
+
+        single_hostname = self._reverse_name(live_targets[0]) if len(live_targets) == 1 else "N/A"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(scan_jobs))) as executor:
+            futures = [
+                executor.submit(self._tcp_probe, target, port, timeout_seconds, self.detect_services)
+                for target, port in scan_jobs
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                result["hostname"] = single_hostname
+                self.result_ready.emit(result)
+                completed += 1
+                self.progress_ready.emit(completed, total)
 
 
 class StartResolveWorker(QThread):
@@ -546,17 +741,22 @@ class PingerApp(QWidget):
         self.port_window = None
         self.port_host_input = None
         self.port_ports_combo = None
+        self.port_scan_type_combo = None
         self.port_timeout_spin = None
+        self.port_concurrency_spin = None
         self.port_run_btn = None
         self.port_status_label = None
         self.port_table = None
         self.port_open_only_check = None
+        self.port_service_probe_check = None
         self.port_progress_bar = None
         self.port_scan_result_count = 0
         self.port_scan_open_count = 0
-        self.port_tool_btn = QPushButton("Port Scanner")
+        self.port_scan_filtered_count = 0
+        self.port_scan_host_count = 0
+        self.port_tool_btn = QPushButton("Network Scanner")
         self.port_tool_btn.setFixedSize(135, 30)
-        self.port_tool_btn.setToolTip("Open TCP port connectivity checks")
+        self.port_tool_btn.setToolTip("Open network discovery and TCP port scanning")
         self.port_tool_btn.clicked.connect(self.show_port_check_window)
 
         # §3.A.c Live displays: latency, elapsed time, reverse DNS
@@ -1143,12 +1343,12 @@ class PingerApp(QWidget):
         )
 
     def show_port_check_window(self):
-        """Open the TCP Port Check diagnostic window."""
+        """Open the Network Scanner diagnostic window."""
         if self.port_window is None:
             self.port_window = QWidget(None, Qt.Window)
             self.port_window.setAttribute(Qt.WA_DeleteOnClose, False)
-            self.port_window.setWindowTitle("Port Scanner")
-            self.port_window.setMinimumSize(760, 520)
+            self.port_window.setWindowTitle("Network Scanner")
+            self.port_window.setMinimumSize(900, 560)
 
             layout = QVBoxLayout()
             layout.setContentsMargins(12,12,12,12)
@@ -1159,17 +1359,24 @@ class PingerApp(QWidget):
             controls.setVerticalSpacing(8)
             self.port_host_input = QLineEdit(self.host_input.text().strip())
             self.port_host_input.setMinimumWidth(300)
+            self.port_scan_type_combo = QComboBox()
+            self.port_scan_type_combo.addItems([
+                "Auto target mode",
+                "Single host port scan",
+                "Network discovery + ports",
+            ])
             self.port_ports_combo = QComboBox()
             self.port_ports_combo.setEditable(True)
             self.port_ports_combo.addItems([
+                "Top troubleshooting: 20-23,25,53,80,110,139,143,443,445,587,993,995,3389,5900,8080,8443",
                 "Common web: 80,443,8080,8443",
                 "Common remote: 22,23,3389,5900",
                 "Common mail: 25,110,143,465,587,993,995",
                 "Common network: 21,22,23,53,80,123,139,443,445,3389",
-                "Top troubleshooting: 20-23,25,53,80,110,139,143,443,445,587,993,995,3389,5900,8080,8443",
+                "Top 1024 TCP ports: 1-1024",
+                "All TCP ports: 1-65535",
                 "443",
                 "80",
-                "1-1024",
             ])
             self.port_ports_combo.setMinimumWidth(300)
             self.port_timeout_spin = QSpinBox()
@@ -1177,18 +1384,28 @@ class PingerApp(QWidget):
             self.port_timeout_spin.setSingleStep(250)
             self.port_timeout_spin.setValue(3000)
             self.port_timeout_spin.setSuffix(" ms")
+            self.port_concurrency_spin = QSpinBox()
+            self.port_concurrency_spin.setRange(1, 256)
+            self.port_concurrency_spin.setValue(64)
             self.port_run_btn = QPushButton("Run Scan")
             self.port_run_btn.clicked.connect(self.start_port_check)
-            self.port_open_only_check = QCheckBox("Show open only")
+            self.port_open_only_check = QCheckBox("Show open/live only")
+            self.port_service_probe_check = QCheckBox("Probe service banners")
+            self.port_service_probe_check.setToolTip("Best-effort banner, HTTP header, and TLS handshake checks on open ports.")
 
             controls.addWidget(QLabel("Host"), 0, 0)
             controls.addWidget(self.port_host_input, 0, 1)
-            controls.addWidget(QLabel("Port(s)"), 0, 2)
-            controls.addWidget(self.port_ports_combo, 0, 3)
-            controls.addWidget(QLabel("Timeout"), 1, 0)
-            controls.addWidget(self.port_timeout_spin, 1, 1)
-            controls.addWidget(self.port_open_only_check, 1, 2)
-            controls.addWidget(self.port_run_btn, 1, 3)
+            controls.addWidget(QLabel("Mode"), 0, 2)
+            controls.addWidget(self.port_scan_type_combo, 0, 3)
+            controls.addWidget(QLabel("Port(s)"), 1, 0)
+            controls.addWidget(self.port_ports_combo, 1, 1, 1, 3)
+            controls.addWidget(QLabel("Timeout"), 2, 0)
+            controls.addWidget(self.port_timeout_spin, 2, 1)
+            controls.addWidget(QLabel("Parallel"), 2, 2)
+            controls.addWidget(self.port_concurrency_spin, 2, 3)
+            controls.addWidget(self.port_open_only_check, 3, 1)
+            controls.addWidget(self.port_service_probe_check, 3, 2)
+            controls.addWidget(self.port_run_btn, 3, 3)
             controls.setColumnStretch(1, 1)
             layout.addLayout(controls)
 
@@ -1206,8 +1423,8 @@ class PingerApp(QWidget):
             self.port_progress_bar.setFormat("Ready")
             layout.addWidget(self.port_progress_bar)
 
-            self.port_table = QTableWidget(0, 6)
-            self.port_table.setHorizontalHeaderLabels(["Host", "Port", "Service", "Status", "Latency", "Error"])
+            self.port_table = QTableWidget(0, 8)
+            self.port_table.setHorizontalHeaderLabels(["Host", "Hostname", "Port", "Service", "State", "Latency", "MAC", "Details"])
             self.port_table.verticalHeader().setVisible(False)
             self.port_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self.port_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1217,7 +1434,9 @@ class PingerApp(QWidget):
             ph.setSectionResizeMode(2, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(3, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-            ph.setSectionResizeMode(5, QHeaderView.Stretch)
+            ph.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+            ph.setSectionResizeMode(7, QHeaderView.Stretch)
             layout.addWidget(self.port_table, 1)
             self.port_window.setLayout(layout)
 
@@ -1251,10 +1470,35 @@ class PingerApp(QWidget):
                 deduped.append(port)
         if not deduped:
             raise ValueError("Enter at least one port.")
-        return deduped[:1024]
+        return deduped
+
+    def _expand_scan_targets(self, target: str, mode: str):
+        target = target.strip()
+        if not target:
+            raise ValueError("Enter a host, IP address, or CIDR range.")
+
+        should_parse_range = "/" in target or mode == "Network discovery + ports"
+        if should_parse_range:
+            try:
+                network = ipaddress.ip_network(target, strict=False)
+            except ValueError as e:
+                if mode == "Network discovery + ports":
+                    raise ValueError(f"Enter a valid CIDR range, for example 192.168.1.0/24. {e}")
+                return [target]
+
+            if network.version != 4:
+                raise ValueError("Network discovery currently supports IPv4 ranges only.")
+            if network.num_addresses > 512:
+                raise ValueError("Network discovery is limited to 512 addresses at a time.")
+            hosts = list(network.hosts()) if network.prefixlen < 31 else list(network)
+            if not hosts:
+                raise ValueError("The selected range has no usable hosts.")
+            return [str(host) for host in hosts]
+
+        return [target]
 
     def start_port_check(self):
-        """Run TCP connectivity checks in the Port Check window."""
+        """Run network discovery and TCP scanning in the Network Scanner window."""
         if self.port_check_worker is not None and self.port_check_worker.isRunning():
             return
 
@@ -1265,24 +1509,55 @@ class PingerApp(QWidget):
         try:
             ports = self._parse_port_list(self.port_ports_combo.currentText())
         except ValueError as e:
-            QMessageBox.warning(self, "Port Check Error", str(e))
+            QMessageBox.warning(self, "Network Scanner Error", str(e))
+            return
+
+        mode = self.port_scan_type_combo.currentText() if self.port_scan_type_combo is not None else "Auto target mode"
+        try:
+            targets = self._expand_scan_targets(host, mode)
+        except ValueError as e:
+            QMessageBox.warning(self, "Network Scanner Error", str(e))
+            return
+
+        if len(targets) > 1 and len(ports) > 256:
+            QMessageBox.warning(
+                self,
+                "Network Scanner Limit",
+                "Network range scans are limited to 256 selected ports per live host. "
+                "Use a smaller port preset for ranges, or scan one host for a full 1-65535 port sweep.",
+            )
             return
 
         timeout_ms = self.port_timeout_spin.value() if self.port_timeout_spin is not None else 3000
+        max_workers = self.port_concurrency_spin.value() if self.port_concurrency_spin is not None else 64
+        detect_services = self.port_service_probe_check is not None and self.port_service_probe_check.isChecked()
         self.port_table.setRowCount(0)
         self.port_scan_result_count = 0
         self.port_scan_open_count = 0
+        self.port_scan_filtered_count = 0
+        self.port_scan_host_count = 0
         self.port_run_btn.setEnabled(False)
         if self.port_progress_bar is not None:
             self.port_progress_bar.setValue(0)
             self.port_progress_bar.setFormat("Scanning... 0%")
-        self.port_status_label.setText(f"Scanning {len(ports)} TCP port(s) on {host}...")
+        if len(targets) == 1:
+            self.port_status_label.setText(f"Scanning {len(ports)} TCP port(s) on {host}...")
+        else:
+            self.port_status_label.setText(f"Discovering {len(targets)} host(s), then scanning {len(ports)} TCP port(s) on live hosts...")
         self.port_status_label.setStyleSheet(
             "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
             "border-radius: 4px; padding: 8px; font-weight: bold; }"
         )
 
-        self.port_check_worker = PortCheckWorker(host, ports, timeout_ms=timeout_ms)
+        self.port_check_worker = PortCheckWorker(
+            host,
+            targets,
+            ports,
+            timeout_ms=timeout_ms,
+            detect_services=detect_services,
+            max_workers=max_workers,
+        )
+        self.port_check_worker.host_ready.connect(self._add_port_check_result)
         self.port_check_worker.result_ready.connect(self._add_port_check_result)
         self.port_check_worker.progress_ready.connect(self._update_port_scan_progress)
         self.port_check_worker.finished.connect(self._finish_port_check)
@@ -1293,32 +1568,44 @@ class PingerApp(QWidget):
     def _add_port_check_result(self, result: dict):
         if self.port_table is None:
             return
-        self.port_scan_result_count += 1
-        if result.get("status") == "Open":
+        status = result.get("status", "")
+        if status == "Host Up":
+            self.port_scan_host_count += 1
+        else:
+            self.port_scan_result_count += 1
+        if status == "Open":
             self.port_scan_open_count += 1
+        if status == "Filtered":
+            self.port_scan_filtered_count += 1
         if (
             self.port_open_only_check is not None
             and self.port_open_only_check.isChecked()
-            and result.get("status") != "Open"
+            and status not in {"Open", "Host Up"}
         ):
             return
         latency = "N/A" if result.get("latency") is None else f"{result['latency']:.1f} ms"
         row_values = [
             result.get("host", ""),
+            result.get("hostname", "N/A"),
             str(result.get("port", "")),
             result.get("service", ""),
-            result.get("status", ""),
+            status,
             latency,
+            result.get("mac", "N/A"),
             result.get("error", ""),
         ]
         row = self.port_table.rowCount()
         self.port_table.insertRow(row)
         for col, value in enumerate(row_values):
             item = QTableWidgetItem(value)
-            if col == 3:
+            if col == 4:
                 if value == "Open":
                     item.setBackground(QBrush(QColor("#e6f4ea")))
-                else:
+                elif value == "Host Up":
+                    item.setBackground(QBrush(QColor("#e8f0fe")))
+                elif value == "Filtered":
+                    item.setBackground(QBrush(QColor("#fff4ce")))
+                elif value in {"Closed", "No Response"}:
                     item.setBackground(QBrush(QColor("#fce8e6")))
             self.port_table.setItem(row, col, item)
 
@@ -1333,9 +1620,11 @@ class PingerApp(QWidget):
         if self.port_run_btn is not None:
             self.port_run_btn.setEnabled(True)
         if self.port_status_label is not None:
-            suffix = " (open-only view)" if self.port_open_only_check is not None and self.port_open_only_check.isChecked() else ""
+            suffix = " (open/live-only view)" if self.port_open_only_check is not None and self.port_open_only_check.isChecked() else ""
             self.port_status_label.setText(
-                f"Completed. {self.port_scan_open_count}/{self.port_scan_result_count} port(s) open{suffix}."
+                f"Completed. {self.port_scan_host_count} host(s) found, "
+                f"{self.port_scan_open_count}/{self.port_scan_result_count} port(s) open, "
+                f"{self.port_scan_filtered_count} filtered/dropped{suffix}."
             )
             self.port_status_label.setStyleSheet(
                 "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "

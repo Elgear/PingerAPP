@@ -21,6 +21,7 @@
 - Moved Speed Test from the Ping Panel into the Tools launcher.
 - Added a Port Check tool window for TCP connectivity checks across one or more ports with latency and error details.
 - Upgraded Port Check into a safe TCP Port Scanner with presets, port ranges, service names, progress, and open-only display.
+- Expanded Port Scanner into a Network Scanner with CIDR host discovery, concurrent TCP scanning, open/closed/filtered state reporting, full-port scan support for single hosts, optional light service probes, and MAC lookup where available.
 
 ## 2026-05-07
 
