@@ -23,6 +23,7 @@ Current tools:
 - Loaded Latency
 - Route Health
 - Wi-Fi Diagnostics
+- Speed Targets
 - Network Scanner
 - HTTP Test
 - DNS / WHOIS
@@ -37,11 +38,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 
 ## Next Features
 
-1. DNS / CDN Target Check
-   - Compare multiple speed test servers and show server distance/provider where available.
-   - Some speed tests are limited by a poor server or CDN target selection.
-
-2. Packaging
+1. Packaging
    - PyInstaller build configuration.
    - Include bundled LibreSpeed CLI and license files.
    - Include bundled iperf3 runtime and license files.
@@ -60,6 +57,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 - Loaded Latency: bufferbloat check that captures idle ping baseline, runs LibreSpeed load, measures loaded ping latency/loss/jitter, and reports latency increase under load.
 - Route Health: LibreSpeed load plus gateway, ISP first-hop, and public-target ping health checks to identify whether slowdown starts locally, at the ISP edge, or farther upstream.
 - Wi-Fi Diagnostics: Windows Wi-Fi SSID, BSSID, signal, band, channel, protocol, link rates, security details, and diagnosis for wireless speed limits.
+- Speed Targets: short LibreSpeed comparisons across multiple servers to catch poor server/CDN target selection or routing differences.
 
 ## Packaging
 

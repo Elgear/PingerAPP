@@ -671,6 +671,39 @@ def wifi_diagnosis(info):
         "speed test server choice, router WAN, and ISP profile."
     )
 
+def speed_target_diagnosis(results):
+    completed = [item for item in results if item.get("ok")]
+    if not completed:
+        return "No speed target tests completed. Check LibreSpeed CLI, internet access, and selected servers."
+    if len(completed) == 1:
+        item = completed[0]
+        return (
+            f"One target completed: {item.get('server_label', 'N/A')} at {item.get('download_text', 'N/A')} down. "
+            "Compare at least two targets to judge whether server/CDN choice is affecting the result."
+        )
+
+    downloads = [float(item.get("download") or 0) for item in completed]
+    latencies = [float(item.get("latency") or 0) for item in completed if item.get("latency") is not None]
+    best_down = max(downloads) if downloads else 0
+    worst_down = min(downloads) if downloads else 0
+    best = max(completed, key=lambda item: float(item.get("download") or 0))
+
+    if len(completed) >= 2 and best_down > 0 and worst_down / best_down < 0.65:
+        return (
+            f"Speed target choice matters here. Best tested server was {best.get('server_label', 'N/A')} at "
+            f"{best_down:.2f} Mbps, while the slowest completed server was {worst_down:.2f} Mbps. "
+            "A poor server/CDN target or routing difference can limit a single speed test result."
+        )
+    if latencies and max(latencies) - min(latencies) >= 40:
+        return (
+            "Latency differs heavily between tested targets. Server distance, routing, peering, or target load may affect "
+            "speed test results."
+        )
+    return (
+        "Tested speed targets were broadly consistent. If speed is still lower than expected, focus on adapter link speed, "
+        "LAN throughput, Wi-Fi quality, route health, router WAN, or ISP profile."
+    )
+
 
 class TracerouteWorker(QThread):
     """Runs tracert/traceroute in background and emits each line."""
@@ -2446,6 +2479,155 @@ class SpeedTestServerListWorker(QThread):
         self.servers_ready.emit(servers)
 
 
+class SpeedTargetCompareWorker(QThread):
+    """Runs short LibreSpeed tests against selected servers for target comparison."""
+    progress_ready = pyqtSignal(str)
+    result_ready = pyqtSignal(dict)
+    finished_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, executable: str, servers: list, duration=5):
+        super().__init__()
+        self.executable = executable
+        self.servers = list(servers or [])
+        self.duration = max(1, int(duration))
+        self._stop_requested = False
+        self._current_process = None
+
+    def stop(self):
+        self._stop_requested = True
+        proc = self._current_process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+    def run(self):
+        if not self.servers:
+            self.error_ready.emit("Select at least one LibreSpeed server to compare.")
+            return
+
+        results = []
+        for index, server in enumerate(self.servers, 1):
+            if self._stop_requested:
+                break
+            label = f"{server.get('id', 'N/A')} - {server.get('name', 'N/A')} ({server.get('sponsor', 'N/A')})"
+            self.progress_ready.emit(f"Testing {index}/{len(self.servers)}: {label}")
+            result = self._run_server_test(server)
+            results.append(result)
+            self.result_ready.emit(result)
+
+        if self._stop_requested:
+            self.finished_ready.emit({
+                "stopped": True,
+                "results": results,
+                "diagnosis": "Speed target comparison stopped before all selected servers completed.",
+            })
+            return
+
+        self.finished_ready.emit({
+            "stopped": False,
+            "results": results,
+            "diagnosis": speed_target_diagnosis(results),
+        })
+
+    def _run_server_test(self, server):
+        started = time.monotonic()
+        cmd = [
+            self.executable,
+            "--json",
+            "--no-icmp",
+            "--duration", str(self.duration),
+            "--telemetry-level", "disabled",
+            "--server", str(server.get("id")),
+        ]
+        try:
+            kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+            }
+            if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            self._current_process = subprocess.Popen(cmd, **kwargs)
+            stdout, stderr = self._current_process.communicate(timeout=max(60, self.duration + 90))
+            returncode = self._current_process.returncode
+        except FileNotFoundError:
+            return self._error_result(server, "LibreSpeed CLI executable was not found.", started)
+        except subprocess.TimeoutExpired:
+            if self._current_process is not None:
+                self._current_process.kill()
+                stdout, stderr = self._current_process.communicate(timeout=5)
+            return self._error_result(server, "Speed target test timed out.", started)
+        except OSError as e:
+            return self._error_result(server, f"Could not run LibreSpeed CLI: {e}", started)
+        finally:
+            self._current_process = None
+
+        if self._stop_requested:
+            return self._error_result(server, "Stopped.", started)
+        if returncode != 0:
+            message = (stderr or stdout or "LibreSpeed CLI failed.").strip()
+            return self._error_result(server, message, started)
+
+        try:
+            parsed = json.loads((stdout or "").strip())
+        except json.JSONDecodeError:
+            output = (stdout or "").strip()
+            start = output.find("{")
+            end = output.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                return self._error_result(server, "LibreSpeed CLI did not return JSON output.", started)
+            try:
+                parsed = json.loads(output[start:end+1])
+            except json.JSONDecodeError:
+                return self._error_result(server, "Could not parse LibreSpeed JSON output.", started)
+
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else {}
+        if not isinstance(parsed, dict):
+            return self._error_result(server, "LibreSpeed CLI returned an unsupported JSON shape.", started)
+
+        latency = parsed.get("ping")
+        jitter = parsed.get("jitter")
+        return {
+            "ok": True,
+            "id": str(server.get("id", "N/A")),
+            "name": server.get("name", "N/A"),
+            "sponsor": server.get("sponsor", "N/A"),
+            "url": server.get("url", "N/A"),
+            "server_label": f"{server.get('name', 'N/A')} ({server.get('sponsor', 'N/A')})",
+            "download": parsed.get("download"),
+            "upload": parsed.get("upload"),
+            "latency": latency,
+            "jitter": jitter,
+            "download_text": format_mbps(parsed.get("download")),
+            "upload_text": format_mbps(parsed.get("upload")),
+            "latency_text": "N/A" if latency is None else f"{float(latency):.1f} ms",
+            "jitter_text": "N/A" if jitter is None else f"{float(jitter):.1f} ms",
+            "elapsed_text": f"{time.monotonic() - started:.1f} sec",
+            "error": "N/A",
+        }
+
+    def _error_result(self, server, error, started):
+        return {
+            "ok": False,
+            "id": str(server.get("id", "N/A")),
+            "name": server.get("name", "N/A"),
+            "sponsor": server.get("sponsor", "N/A"),
+            "url": server.get("url", "N/A"),
+            "server_label": f"{server.get('name', 'N/A')} ({server.get('sponsor', 'N/A')})",
+            "download": None,
+            "upload": None,
+            "latency": None,
+            "jitter": None,
+            "download_text": "N/A",
+            "upload_text": "N/A",
+            "latency_text": "N/A",
+            "jitter_text": "N/A",
+            "elapsed_text": f"{time.monotonic() - started:.1f} sec",
+            "error": error,
+        }
+
+
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -2996,6 +3178,23 @@ class PingerApp(QWidget):
         self.wifi_tool_btn.setFixedSize(135, 30)
         self.wifi_tool_btn.setToolTip("Check Wi-Fi SSID, signal, band, channel, protocol, and link rates")
         self.wifi_tool_btn.clicked.connect(self.show_wifi_diagnostics_window)
+        self.speed_targets_window = None
+        self.speed_targets_server_worker = None
+        self.speed_targets_compare_worker = None
+        self.speed_targets_servers = []
+        self.speed_targets_last_result = None
+        self.speed_targets_status_label = None
+        self.speed_targets_refresh_btn = None
+        self.speed_targets_run_btn = None
+        self.speed_targets_stop_btn = None
+        self.speed_targets_count_spin = None
+        self.speed_targets_duration_spin = None
+        self.speed_targets_table = None
+        self.speed_targets_diagnosis_box = None
+        self.speed_targets_tool_btn = QPushButton("Speed Targets")
+        self.speed_targets_tool_btn.setFixedSize(135, 30)
+        self.speed_targets_tool_btn.setToolTip("Compare LibreSpeed servers to catch poor target/CDN selection")
+        self.speed_targets_tool_btn.clicked.connect(self.show_speed_targets_window)
         self.loaded_window = None
         self.loaded_target_input = None
         self.loaded_baseline_spin = None
@@ -3271,6 +3470,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.loaded_latency_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.route_health_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.wifi_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.speed_targets_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
@@ -5347,6 +5547,263 @@ class PingerApp(QWidget):
         if self.wifi_refresh_btn is not None:
             self.wifi_refresh_btn.setEnabled(True)
 
+    def show_speed_targets_window(self):
+        """Open LibreSpeed target comparison diagnostics."""
+        if self.speed_targets_window is None:
+            self.speed_targets_window = QWidget(None, Qt.Window)
+            self.speed_targets_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.speed_targets_window.setWindowTitle("Speed Targets")
+            self.speed_targets_window.setMinimumSize(980, 650)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Comparison")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.speed_targets_refresh_btn = QPushButton("Refresh Targets")
+            self.speed_targets_refresh_btn.clicked.connect(self.refresh_speed_targets)
+            self.speed_targets_count_spin = QSpinBox()
+            self.speed_targets_count_spin.setRange(1, 10)
+            self.speed_targets_count_spin.setValue(3)
+            self.speed_targets_count_spin.setToolTip("Number of listed LibreSpeed targets to compare, starting from the top of the refreshed list.")
+            self.speed_targets_duration_spin = QSpinBox()
+            self.speed_targets_duration_spin.setRange(3, 20)
+            self.speed_targets_duration_spin.setValue(5)
+            self.speed_targets_duration_spin.setSuffix(" sec")
+            self.speed_targets_duration_spin.setToolTip("Short test duration per target. Higher is more stable but uses more data.")
+            self.speed_targets_run_btn = QPushButton("Compare Targets")
+            self.speed_targets_run_btn.clicked.connect(self.start_speed_targets_compare)
+            self.speed_targets_stop_btn = QPushButton("Stop")
+            self.speed_targets_stop_btn.setEnabled(False)
+            self.speed_targets_stop_btn.clicked.connect(self.stop_speed_targets_compare)
+            controls.addWidget(self.speed_targets_refresh_btn, 0, 0)
+            controls.addWidget(QLabel("Targets"), 0, 1)
+            controls.addWidget(self.speed_targets_count_spin, 0, 2)
+            controls.addWidget(QLabel("Duration each"), 0, 3)
+            controls.addWidget(self.speed_targets_duration_spin, 0, 4)
+            controls.addWidget(self.speed_targets_run_btn, 0, 5)
+            controls.addWidget(self.speed_targets_stop_btn, 0, 6)
+            controls.setColumnStretch(6, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.speed_targets_status_label = QLabel("Ready")
+            self.speed_targets_status_label.setAlignment(Qt.AlignCenter)
+            self.speed_targets_status_label.setWordWrap(True)
+            self.speed_targets_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.speed_targets_status_label)
+
+            self.speed_targets_table = QTableWidget(0, 10)
+            self.speed_targets_table.setHorizontalHeaderLabels([
+                "ID", "Name", "Sponsor", "URL", "Download", "Upload", "Latency", "Jitter", "Elapsed", "Error"
+            ])
+            self.speed_targets_table.verticalHeader().setVisible(False)
+            self.speed_targets_table.setAlternatingRowColors(True)
+            self.speed_targets_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.speed_targets_table.setSelectionBehavior(QTableWidget.SelectRows)
+            header = self.speed_targets_table.horizontalHeader()
+            for col in range(0, 10):
+                header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.Stretch)
+            layout.addWidget(self.speed_targets_table, 1)
+
+            diagnosis_group = QGroupBox("Diagnosis")
+            diagnosis_layout = QVBoxLayout()
+            self.speed_targets_diagnosis_box = QTextEdit()
+            self.speed_targets_diagnosis_box.setReadOnly(True)
+            self.speed_targets_diagnosis_box.setMinimumHeight(100)
+            self.speed_targets_diagnosis_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            diagnosis_layout.addWidget(self.speed_targets_diagnosis_box)
+            diagnosis_group.setLayout(diagnosis_layout)
+            layout.addWidget(diagnosis_group)
+
+            self.speed_targets_window.setLayout(layout)
+
+        self.speed_targets_window.show()
+        self.speed_targets_window.raise_()
+        self.speed_targets_window.activateWindow()
+        if not self.speed_targets_servers:
+            QTimer.singleShot(0, self.refresh_speed_targets)
+
+    def _set_speed_targets_status(self, message: str, level="info"):
+        if self.speed_targets_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.speed_targets_status_label.setText(message)
+        self.speed_targets_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+    def refresh_speed_targets(self):
+        if self.speed_targets_server_worker is not None and self.speed_targets_server_worker.isRunning():
+            return
+        executable = self._find_speedtest_executable()
+        if not executable:
+            self._set_speed_targets_status(
+                "LibreSpeed CLI not found. Put librespeed-cli.exe in tools/librespeed or install librespeed-cli on PATH.",
+                "error",
+            )
+            return
+        self._set_speed_targets_controls_enabled(False, refreshing=True)
+        self._set_speed_targets_status("Refreshing LibreSpeed target list...", "running")
+        self.speed_targets_server_worker = SpeedTestServerListWorker(executable)
+        self.speed_targets_server_worker.servers_ready.connect(self._set_speed_targets_servers)
+        self.speed_targets_server_worker.error_ready.connect(self._set_speed_targets_error)
+        self.speed_targets_server_worker.finished.connect(self._finish_speed_targets_refresh)
+        self.speed_targets_server_worker.finished.connect(self.speed_targets_server_worker.deleteLater)
+        self.speed_targets_server_worker.finished.connect(lambda: setattr(self, "speed_targets_server_worker", None))
+        self.speed_targets_server_worker.start()
+
+    def _set_speed_targets_controls_enabled(self, enabled: bool, refreshing=False, running=False):
+        for widget in (
+            self.speed_targets_refresh_btn,
+            self.speed_targets_count_spin,
+            self.speed_targets_duration_spin,
+            self.speed_targets_run_btn,
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+        if self.speed_targets_stop_btn is not None:
+            self.speed_targets_stop_btn.setEnabled(running)
+        if refreshing and self.speed_targets_refresh_btn is not None:
+            self.speed_targets_refresh_btn.setEnabled(False)
+
+    def _set_speed_targets_servers(self, servers: list):
+        self.speed_targets_servers = servers
+        self.speed_targets_last_result = None
+        if self.speed_targets_diagnosis_box is not None:
+            self.speed_targets_diagnosis_box.setPlainText(
+                "Targets loaded. Compare a few listed servers to see whether server/CDN choice changes the result."
+            )
+        self._populate_speed_targets_table(servers)
+        self._set_speed_targets_status(f"Loaded {len(servers)} LibreSpeed targets.", "ok")
+
+    def _populate_speed_targets_table(self, servers):
+        if self.speed_targets_table is None:
+            return
+        self.speed_targets_table.setRowCount(len(servers))
+        for row, server in enumerate(servers):
+            values = [
+                server.get("id", "N/A"),
+                server.get("name", "N/A"),
+                server.get("sponsor", "N/A"),
+                server.get("url", "N/A"),
+                "Not tested",
+                "Not tested",
+                "Not tested",
+                "Not tested",
+                "Not tested",
+                "",
+            ]
+            for col, value in enumerate(values):
+                self.speed_targets_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.speed_targets_table.resizeRowsToContents()
+
+    def _finish_speed_targets_refresh(self):
+        self._set_speed_targets_controls_enabled(True)
+
+    def _set_speed_targets_error(self, message: str):
+        self._set_speed_targets_status(message, "error")
+        if self.speed_targets_diagnosis_box is not None:
+            self.speed_targets_diagnosis_box.setPlainText(message)
+
+    def start_speed_targets_compare(self):
+        if self.speed_targets_compare_worker is not None and self.speed_targets_compare_worker.isRunning():
+            return
+        executable = self._find_speedtest_executable()
+        if not executable:
+            self._set_speed_targets_status(
+                "LibreSpeed CLI not found. Put librespeed-cli.exe in tools/librespeed or install librespeed-cli on PATH.",
+                "error",
+            )
+            return
+        if not self.speed_targets_servers:
+            QMessageBox.warning(self, "Speed Targets Error", "Refresh targets before comparing them.")
+            return
+
+        count = self.speed_targets_count_spin.value() if self.speed_targets_count_spin is not None else 3
+        selected = self.speed_targets_servers[:count]
+        self.speed_targets_last_result = None
+        if self.speed_targets_diagnosis_box is not None:
+            self.speed_targets_diagnosis_box.clear()
+        self._populate_speed_targets_table(self.speed_targets_servers)
+        self._set_speed_targets_controls_enabled(False, running=True)
+        self._set_speed_targets_status("Comparing speed targets...", "running")
+        self.speed_targets_compare_worker = SpeedTargetCompareWorker(
+            executable,
+            selected,
+            duration=self.speed_targets_duration_spin.value() if self.speed_targets_duration_spin is not None else 5,
+        )
+        self.speed_targets_compare_worker.progress_ready.connect(lambda message: self._set_speed_targets_status(message, "running"))
+        self.speed_targets_compare_worker.result_ready.connect(self._set_speed_target_row_result)
+        self.speed_targets_compare_worker.finished_ready.connect(self._set_speed_targets_compare_result)
+        self.speed_targets_compare_worker.error_ready.connect(self._set_speed_targets_error)
+        self.speed_targets_compare_worker.finished.connect(self._finish_speed_targets_compare)
+        self.speed_targets_compare_worker.finished.connect(self.speed_targets_compare_worker.deleteLater)
+        self.speed_targets_compare_worker.finished.connect(lambda: setattr(self, "speed_targets_compare_worker", None))
+        self.speed_targets_compare_worker.start()
+
+    def stop_speed_targets_compare(self):
+        if self.speed_targets_compare_worker is not None and self.speed_targets_compare_worker.isRunning():
+            self.speed_targets_compare_worker.stop()
+            self._set_speed_targets_status("Stopping target comparison...", "running")
+
+    def _set_speed_target_row_result(self, result: dict):
+        if self.speed_targets_table is None:
+            return
+        row = None
+        for index, server in enumerate(self.speed_targets_servers):
+            if str(server.get("id")) == str(result.get("id")):
+                row = index
+                break
+        if row is None:
+            return
+        values = [
+            result.get("id", "N/A"),
+            result.get("name", "N/A"),
+            result.get("sponsor", "N/A"),
+            result.get("url", "N/A"),
+            result.get("download_text", "N/A"),
+            result.get("upload_text", "N/A"),
+            result.get("latency_text", "N/A"),
+            result.get("jitter_text", "N/A"),
+            result.get("elapsed_text", "N/A"),
+            result.get("error", "N/A"),
+        ]
+        for col, value in enumerate(values):
+            self.speed_targets_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.speed_targets_table.resizeRowsToContents()
+
+    def _set_speed_targets_compare_result(self, result: dict):
+        self.speed_targets_last_result = result
+        diagnosis = result.get("diagnosis", "N/A")
+        if self.speed_targets_diagnosis_box is not None:
+            self.speed_targets_diagnosis_box.setPlainText(diagnosis)
+        if result.get("stopped"):
+            self._set_speed_targets_status("Speed target comparison stopped.", "info")
+            return
+        has_error = any(not item.get("ok") for item in result.get("results", []))
+        self._set_speed_targets_status(
+            "Speed target comparison completed." if not has_error else "Speed target comparison completed with errors.",
+            "ok" if not has_error else "error",
+        )
+
+    def _finish_speed_targets_compare(self):
+        self._set_speed_targets_controls_enabled(True)
+
     def show_loaded_latency_window(self):
         """Open the bufferbloat / loaded latency diagnostic window."""
         if self.loaded_window is None:
@@ -6341,6 +6798,14 @@ class PingerApp(QWidget):
             <li>Use this when a gigabit service looks slow over Wi-Fi, especially when Adapter Info and LAN/Route tests do not show a wired bottleneck.</li>
         </ul>
 
+        <h3>Speed Targets</h3>
+        <ul>
+            <li>Compares multiple LibreSpeed test targets with short runs to check whether server/CDN choice changes the result.</li>
+            <li><b>Targets</b> controls how many refreshed LibreSpeed servers to test, starting from the top of the list.</li>
+            <li><b>Duration each</b> keeps the comparison short. Increase it only when you need more stable numbers.</li>
+            <li>If one target is much slower than another, a single poor speed test server, CDN target, or route can be misleading.</li>
+        </ul>
+
         <h3>Speed Test</h3>
         <ul>
             <li>Uses LibreSpeed CLI to measure download, upload, latency, and jitter.</li>
@@ -6406,7 +6871,7 @@ class PingerApp(QWidget):
         <h3>Report</h3>
         <ul>
             <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
-            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Wi-Fi Diagnostics, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
+            <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Wi-Fi Diagnostics, Speed Targets, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
             <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
             <li><b>Save as TXT</b> writes the current report to a text file.</li>
         </ul>
@@ -6444,6 +6909,7 @@ class PingerApp(QWidget):
                 ("loaded_latency", "Loaded Latency"),
                 ("route_health", "Route Health"),
                 ("wifi_diagnostics", "Wi-Fi Diagnostics"),
+                ("speed_targets", "Speed Targets"),
                 ("speedtest_history", "Speed Test history"),
                 ("dns_lookup", "Last DNS lookup"),
                 ("traceroute", "Last traceroute"),
@@ -6538,6 +7004,7 @@ class PingerApp(QWidget):
             ("loaded_latency", "Loaded Latency", self._report_loaded_latency_lines),
             ("route_health", "Route Health", self._report_route_health_lines),
             ("wifi_diagnostics", "Wi-Fi Diagnostics", self._report_wifi_diagnostics_lines),
+            ("speed_targets", "Speed Targets", self._report_speed_targets_lines),
             ("speedtest_history", "Speed Test History", self._report_speedtest_history_lines),
             ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
             ("traceroute", "Last Traceroute", self._report_traceroute_lines),
@@ -6775,6 +7242,23 @@ class PingerApp(QWidget):
         lines = [f"{label}: {result.get(key, 'N/A') or 'N/A'}" for label, key in rows]
         if result.get("error"):
             lines.extend(["", "Error:", result.get("error", "N/A")])
+        lines.extend(["", "Diagnosis:", result.get("diagnosis", "N/A")])
+        return lines
+
+    def _report_speed_targets_lines(self):
+        if not self.speed_targets_last_result:
+            return ["No Speed Targets result available."]
+        result = self.speed_targets_last_result
+        lines = ["Compared Targets:"]
+        for item in result.get("results", []):
+            lines.extend([
+                f"{item.get('id', 'N/A')} - {item.get('name', 'N/A')} ({item.get('sponsor', 'N/A')}):",
+                f"  URL: {item.get('url', 'N/A')}",
+                f"  Download/Upload: {item.get('download_text', 'N/A')} / {item.get('upload_text', 'N/A')}",
+                f"  Latency/Jitter: {item.get('latency_text', 'N/A')} / {item.get('jitter_text', 'N/A')}",
+                f"  Elapsed: {item.get('elapsed_text', 'N/A')}",
+                f"  Error: {item.get('error', 'N/A')}",
+            ])
         lines.extend(["", "Diagnosis:", result.get("diagnosis", "N/A")])
         return lines
 
@@ -7999,6 +8483,8 @@ class PingerApp(QWidget):
         if self.wifi_worker is not None and self.wifi_worker.isRunning():
             self.wifi_worker.quit()
             self.wifi_worker.wait(1000)
+        if self.speed_targets_compare_worker is not None and self.speed_targets_compare_worker.isRunning():
+            self.speed_targets_compare_worker.stop()
         if self.gateway_stability_worker is not None and self.gateway_stability_worker.isRunning():
             self.gateway_stability_worker.stop()
         self.stop_lan_server()
