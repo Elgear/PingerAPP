@@ -12,6 +12,7 @@
 - Removed the LibreSpeed packet-loss row, added Speed Test run history, and added a duration-based running progress bar.
 - Auto-load the LibreSpeed server list when the Speed Test window opens, clear stale current results before each run, and show a clearer error when a selected server returns no result.
 - Added public ISP lookup, hostname, and primary MAC address to Host Info, and reused the ISP lookup in the Speed Test window when LibreSpeed does not provide ISP data.
+- Changed the Speed Test progress bar to update once per second against the configured test duration.
 
 ## 2026-05-07
 

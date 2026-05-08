@@ -1244,12 +1244,12 @@ class PingerApp(QWidget):
             self.speedtest_progress_bar.setFormat("Running... 0%")
 
         self.speedtest_progress_timer = QTimer(self)
-        self.speedtest_progress_timer.setInterval(250)
+        self.speedtest_progress_timer.setInterval(1000)
         self.speedtest_progress_timer.timeout.connect(self._update_speedtest_progress)
         self.speedtest_progress_timer.start()
 
     def _update_speedtest_progress(self):
-        self.speedtest_progress_elapsed_ms += 250
+        self.speedtest_progress_elapsed_ms += 1000
         pct = min(100, int((self.speedtest_progress_elapsed_ms / self.speedtest_progress_total_ms) * 100))
         if self.speedtest_progress_bar is not None:
             self.speedtest_progress_bar.setValue(pct)
