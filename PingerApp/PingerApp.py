@@ -462,6 +462,74 @@ class DnsWhoisWorker(QThread):
         self.result_ready.emit("\n\n".join(sections))
 
 
+def summarize_nslookup_output(output: str):
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    if not lines:
+        return "N/A"
+    useful = []
+    skip_prefixes = ("server:",)
+    for line in lines:
+        lower = line.lower()
+        if any(lower.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        if lower.startswith("address:") and not useful:
+            continue
+        useful.append(line)
+    return "\n".join(useful[-20:]) if useful else "\n".join(lines[-20:])
+
+
+class DnsCompareWorker(QThread):
+    """Compares DNS answers from several resolvers using nslookup."""
+    result_ready = pyqtSignal(dict)
+
+    RESOLVERS = [
+        ("System", None),
+        ("Cloudflare", "1.1.1.1"),
+        ("Google", "8.8.8.8"),
+        ("Quad9", "9.9.9.9"),
+    ]
+
+    def __init__(self, query: str, record_type: str, timeout_ms=5000):
+        super().__init__()
+        self.query = query
+        self.record_type = record_type
+        self.timeout_ms = timeout_ms
+
+    def run(self):
+        timeout_seconds = max(1, self.timeout_ms / 1000)
+        for name, resolver in self.RESOLVERS:
+            cmd = ["nslookup", f"-type={self.record_type}", self.query]
+            if resolver:
+                cmd.append(resolver)
+            started = time.perf_counter()
+            answers = "N/A"
+            error = ""
+            try:
+                kwargs = {"capture_output": True, "text": True, "timeout": timeout_seconds}
+                if platform.system() == "Windows" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                completed = subprocess.run(cmd, **kwargs)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                output = (completed.stdout or completed.stderr or "").strip()
+                answers = summarize_nslookup_output(output)
+                if completed.returncode != 0:
+                    error = (completed.stderr or completed.stdout or f"nslookup exited {completed.returncode}").strip()
+            except subprocess.TimeoutExpired:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                error = f"Timed out after {timeout_seconds:.1f}s"
+            except OSError as e:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                error = str(e)
+
+            self.result_ready.emit({
+                "resolver": name,
+                "server": resolver or "System default",
+                "time_ms": elapsed_ms,
+                "answers": answers,
+                "error": error or "N/A",
+            })
+
+
 class PortCheckWorker(QThread):
     """Runs safe TCP network discovery and port scanning without blocking the UI."""
     result_ready = pyqtSignal(dict)
@@ -951,6 +1019,7 @@ class PingerApp(QWidget):
         self.host_info_worker = None
         self.dns_worker = None
         self.dns_whois_worker = None
+        self.dns_compare_worker = None
         self.start_worker = None
         self.tr_worker = None
         self.port_check_worker = None
@@ -993,6 +1062,17 @@ class PingerApp(QWidget):
         self.dns_tool_btn.setFixedSize(135, 30)
         self.dns_tool_btn.setToolTip("Open DNS, record, and IP ownership lookup")
         self.dns_tool_btn.clicked.connect(self.show_dns_window)
+        self.dns_compare_window = None
+        self.dns_compare_input = None
+        self.dns_compare_record_combo = None
+        self.dns_compare_timeout_spin = None
+        self.dns_compare_run_btn = None
+        self.dns_compare_status_label = None
+        self.dns_compare_table = None
+        self.dns_compare_tool_btn = QPushButton("DNS Compare")
+        self.dns_compare_tool_btn.setFixedSize(135, 30)
+        self.dns_compare_tool_btn.setToolTip("Compare DNS answers across resolvers")
+        self.dns_compare_tool_btn.clicked.connect(self.show_dns_compare_window)
         self.port_window = None
         self.port_host_input = None
         self.port_ports_combo = None
@@ -1514,6 +1594,7 @@ class PingerApp(QWidget):
         tools_layout.addWidget(self.port_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.http_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
+        tools_layout.addWidget(self.dns_compare_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
         tools_group.setLayout(tools_layout)
@@ -2452,6 +2533,150 @@ class PingerApp(QWidget):
             )
         if self.http_error_field is not None:
             self.http_error_field.setText(error)
+
+    def show_dns_compare_window(self):
+        """Open the DNS resolver comparison diagnostic window."""
+        if self.dns_compare_window is None:
+            self.dns_compare_window = QWidget(None, Qt.Window)
+            self.dns_compare_window.setAttribute(Qt.WA_DeleteOnClose, False)
+            self.dns_compare_window.setWindowTitle("DNS Compare")
+            self.dns_compare_window.setMinimumSize(820, 520)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12,12,12,12)
+            layout.setSpacing(10)
+
+            controls_group = QGroupBox("Query")
+            controls = QGridLayout()
+            controls.setHorizontalSpacing(8)
+            controls.setVerticalSpacing(8)
+            self.dns_compare_input = QLineEdit(self.host_input.text().strip())
+            self.dns_compare_input.setPlaceholderText("example.com")
+            self.dns_compare_input.setMinimumWidth(360)
+            self.dns_compare_record_combo = QComboBox()
+            self.dns_compare_record_combo.addItems(["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"])
+            self.dns_compare_timeout_spin = QSpinBox()
+            self.dns_compare_timeout_spin.setRange(1000, 30000)
+            self.dns_compare_timeout_spin.setSingleStep(1000)
+            self.dns_compare_timeout_spin.setValue(5000)
+            self.dns_compare_timeout_spin.setSuffix(" ms")
+            self.dns_compare_run_btn = QPushButton("Run Compare")
+            self.dns_compare_run_btn.clicked.connect(self.start_dns_compare)
+
+            controls.addWidget(QLabel("Hostname"), 0, 0)
+            controls.addWidget(self.dns_compare_input, 0, 1)
+            controls.addWidget(QLabel("Record"), 0, 2)
+            controls.addWidget(self.dns_compare_record_combo, 0, 3)
+            controls.addWidget(QLabel("Timeout"), 0, 4)
+            controls.addWidget(self.dns_compare_timeout_spin, 0, 5)
+            controls.addWidget(self.dns_compare_run_btn, 0, 6)
+            controls.setColumnStretch(1, 1)
+            controls_group.setLayout(controls)
+            layout.addWidget(controls_group)
+
+            self.dns_compare_status_label = QLabel("Ready")
+            self.dns_compare_status_label.setAlignment(Qt.AlignCenter)
+            self.dns_compare_status_label.setStyleSheet(
+                "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
+                "border-radius: 4px; padding: 8px; font-weight: bold; }"
+            )
+            layout.addWidget(self.dns_compare_status_label)
+
+            self.dns_compare_table = QTableWidget(0, 5)
+            self.dns_compare_table.setHorizontalHeaderLabels(["Resolver", "Server", "Time", "Answers", "Error"])
+            self.dns_compare_table.verticalHeader().setVisible(False)
+            self.dns_compare_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.dns_compare_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.dns_compare_table.setWordWrap(True)
+            self.dns_compare_table.setStyleSheet(
+                "QTableWidget::item { padding: 3px 10px 3px 4px; } "
+                "QHeaderView::section { padding: 3px 10px 3px 4px; }"
+            )
+            dh = self.dns_compare_table.horizontalHeader()
+            dh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            dh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            dh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            dh.setSectionResizeMode(3, QHeaderView.Stretch)
+            dh.setSectionResizeMode(4, QHeaderView.Stretch)
+            layout.addWidget(self.dns_compare_table, 1)
+
+            self.dns_compare_window.setLayout(layout)
+
+        if self.dns_compare_input is not None and not self.dns_compare_input.text().strip():
+            self.dns_compare_input.setText(self.host_input.text().strip())
+        self.dns_compare_window.show()
+        self.dns_compare_window.raise_()
+        self.dns_compare_window.activateWindow()
+
+    def start_dns_compare(self):
+        if self.dns_compare_worker is not None and self.dns_compare_worker.isRunning():
+            return
+        query = self.dns_compare_input.text().strip() if self.dns_compare_input is not None else ""
+        if not query:
+            QMessageBox.warning(self, "DNS Compare Error", "Enter a hostname.")
+            return
+
+        self.dns_compare_table.setRowCount(0)
+        self.dns_compare_run_btn.setEnabled(False)
+        self.dns_compare_status_label.setText("Comparing DNS resolvers...")
+        self.dns_compare_status_label.setStyleSheet(
+            "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+        self.dns_compare_worker = DnsCompareWorker(
+            query,
+            self.dns_compare_record_combo.currentText(),
+            timeout_ms=self.dns_compare_timeout_spin.value(),
+        )
+        self.dns_compare_worker.result_ready.connect(self._add_dns_compare_result)
+        self.dns_compare_worker.finished.connect(self._finish_dns_compare)
+        self.dns_compare_worker.finished.connect(self.dns_compare_worker.deleteLater)
+        self.dns_compare_worker.finished.connect(lambda: setattr(self, "dns_compare_worker", None))
+        self.dns_compare_worker.start()
+
+    def _add_dns_compare_result(self, result: dict):
+        if self.dns_compare_table is None:
+            return
+        row = self.dns_compare_table.rowCount()
+        self.dns_compare_table.insertRow(row)
+        values = [
+            result.get("resolver", ""),
+            result.get("server", ""),
+            f"{result.get('time_ms', 0):.1f} ms",
+            wrapped_detail_text(result.get("answers", ""), width=85),
+            wrapped_detail_text(result.get("error", ""), width=85),
+        ]
+        has_error = result.get("error") not in (None, "", "N/A")
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if has_error:
+                item.setBackground(QBrush(QColor("#fff4ce")))
+            self.dns_compare_table.setItem(row, col, item)
+        self.dns_compare_table.resizeRowsToContents()
+
+    def _finish_dns_compare(self):
+        if self.dns_compare_run_btn is not None:
+            self.dns_compare_run_btn.setEnabled(True)
+        error_count = 0
+        if self.dns_compare_table is not None:
+            for row in range(self.dns_compare_table.rowCount()):
+                error_item = self.dns_compare_table.item(row, 4)
+                if error_item is not None and error_item.text() not in ("", "N/A"):
+                    error_count += 1
+        if self.dns_compare_status_label is not None:
+            if error_count:
+                self.dns_compare_status_label.setText(f"DNS compare completed with {error_count} resolver error(s).")
+                self.dns_compare_status_label.setStyleSheet(
+                    "QLabel { background: #fff4ce; color: #8a5a00; border: 1px solid #d8b756; "
+                    "border-radius: 4px; padding: 8px; font-weight: bold; }"
+                )
+            else:
+                self.dns_compare_status_label.setText("DNS compare completed.")
+                self.dns_compare_status_label.setStyleSheet(
+                    "QLabel { background: #e6f4ea; color: #137333; border: 1px solid #8abf9a; "
+                    "border-radius: 4px; padding: 8px; font-weight: bold; }"
+                )
 
     def show_dns_window(self):
         """Open the DNS / WHOIS diagnostic window."""
