@@ -60,7 +60,7 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 - MTU Test: target input, start/max payload, Windows-first `ping -f -l` probing, largest non-fragmenting payload, estimated MTU, and raw ping output/details.
 - Report: selectable sections for Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results, with preview and `.txt` save.
 - Help: offline guide covering the main controls, threshold sliders, monitoring boxes, graphs, diagnostic tools, report builder, and common result interpretation.
-- Adapter Info: active adapter status, link speed, connection type, IPv4, gateway, DNS servers, MAC address, duplex setting where available, interface error/discard counters where available, and 100 Mbps vs gigabit/counter diagnosis.
+- Adapter Info: active adapter status, link speed, connection type, IPv4, gateway, DNS servers, MAC address, duplex setting where available, interface error/discard counters where available, timed Counter Watch transfer/error delta testing, and 100 Mbps vs gigabit/counter diagnosis.
 - LAN Throughput: bundled iperf3 client/server mode to separate local LAN throughput issues from internet, router WAN, ISP profile, or speed test server issues.
 - Gateway Stability: repeated first-hop ping monitor for gateway latency, packet loss, jitter, spikes, raw ping log, and local-vs-upstream diagnosis.
 - Loaded Latency: bufferbloat check that captures idle ping baseline, runs LibreSpeed load, measures loaded ping latency/loss/jitter, and reports latency increase under load.

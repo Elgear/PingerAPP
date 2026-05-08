@@ -391,6 +391,73 @@ def format_interface_traffic(bytes_value=None, packets_value=None, bytes_rate=No
         return f"{format_bytes_decimal(bytes_rate)}/s; {format_packet_rate(packets_rate)}"
     return "N/A"
 
+def numeric_counter(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def counter_delta(before, after, key):
+    start = numeric_counter((before or {}).get(key))
+    end = numeric_counter((after or {}).get(key))
+    if start is None or end is None:
+        return None
+    delta = end - start
+    if delta < 0:
+        return None
+    return delta
+
+def format_count_delta(value):
+    if value is None:
+        return "N/A"
+    return f"+{int(float(value)):,}"
+
+def format_interface_delta(bytes_delta=None, packets_delta=None):
+    if bytes_delta is None and packets_delta is None:
+        return "N/A"
+    return f"{format_bytes_decimal(bytes_delta)}; {format_count_delta(packets_delta)} packets"
+
+def adapter_counter_watch_diagnosis(result):
+    source = str(result.get("counter_source") or "N/A")
+    if source.startswith("Unavailable"):
+        return (
+            f"Counter Watch could not read interface counters ({source}). Try running the app as Administrator if "
+            "Windows blocks adapter statistics."
+        )
+
+    error_delta = sum(value or 0 for value in (
+        result.get("rx_errors_delta"),
+        result.get("tx_errors_delta"),
+        result.get("rx_discards_delta"),
+        result.get("tx_discards_delta"),
+    ))
+    transfer_delta = sum(value or 0 for value in (
+        result.get("rx_bytes_delta"),
+        result.get("tx_bytes_delta"),
+    ))
+
+    if error_delta > 0:
+        return (
+            "Counter Watch saw errors or discards increase during the test. That is suspicious while traffic is being "
+            "generated and can point to cable, switch/router port, NIC, driver, Wi-Fi, or congestion problems."
+        )
+    if transfer_delta > 0:
+        return (
+            "Counter Watch saw traffic move without interface errors or discards increasing. That is a healthy result "
+            "for the adapter during this test window."
+        )
+    if result.get("rx_bytes_delta") is None and result.get("tx_bytes_delta") is None:
+        return (
+            "Counter Watch could read error/discard counters, but traffic byte totals were unavailable from Windows. "
+            "Use the error/discard deltas as the main signal."
+        )
+    return (
+        "Counter Watch did not see traffic or counter errors change. Run it while a Speed Test or LAN Throughput test "
+        "is active to stress the adapter path."
+    )
+
 def interface_counter_diagnosis(info):
     source = str(info.get("counter_source") or "N/A")
     if source.startswith("Unavailable"):
@@ -771,6 +838,14 @@ $items | ConvertTo-Json -Depth 4 -Compress
             "tx_errors_raw": selected.get("TxErrors"),
             "rx_discards_raw": selected.get("RxDiscards"),
             "tx_discards_raw": selected.get("TxDiscards"),
+            "rx_bytes_raw": selected.get("RxBytes"),
+            "tx_bytes_raw": selected.get("TxBytes"),
+            "rx_packets_raw": selected.get("RxPackets"),
+            "tx_packets_raw": selected.get("TxPackets"),
+            "rx_bytes_per_sec_raw": selected.get("RxBytesPerSec"),
+            "tx_bytes_per_sec_raw": selected.get("TxBytesPerSec"),
+            "rx_packets_per_sec_raw": selected.get("RxPacketsPerSec"),
+            "tx_packets_per_sec_raw": selected.get("TxPacketsPerSec"),
         }
         info["diagnosis"] = (
             adapter_link_diagnosis(link_speed, connection_type, info["status"])
@@ -778,6 +853,81 @@ $items | ConvertTo-Json -Depth 4 -Compress
             + interface_counter_diagnosis(info)
         )
         return info
+
+
+class AdapterCounterWatchWorker(QThread):
+    """Compares adapter counters before and after a short test window."""
+    status_ready = pyqtSignal(str)
+    result_ready = pyqtSignal(dict)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, duration_sec=30):
+        super().__init__()
+        self.duration_sec = max(1, int(duration_sec))
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        if platform.system() != "Windows":
+            self.error_ready.emit("Counter Watch is currently implemented for Windows adapters only.")
+            return
+
+        reader = AdapterInfoWorker()
+        try:
+            self.status_ready.emit("Counter Watch baseline captured.")
+            before = reader._windows_adapter_info()
+            for remaining in range(self.duration_sec, 0, -1):
+                if self._stop_requested:
+                    self.status_ready.emit("Counter Watch stopped.")
+                    return
+                self.status_ready.emit(f"Counter Watch running... {remaining} sec remaining")
+                self.msleep(1000)
+            if self._stop_requested:
+                self.status_ready.emit("Counter Watch stopped.")
+                return
+            after = reader._windows_adapter_info()
+        except Exception as e:
+            self.error_ready.emit(f"Counter Watch failed: {e}")
+            return
+
+        duration = float(self.duration_sec)
+        result = {
+            "adapter": after.get("adapter", before.get("adapter", "N/A")),
+            "counter_source": after.get("counter_source", before.get("counter_source", "N/A")),
+            "duration_sec": self.duration_sec,
+            "rx_bytes_delta": counter_delta(before, after, "rx_bytes_raw"),
+            "tx_bytes_delta": counter_delta(before, after, "tx_bytes_raw"),
+            "rx_packets_delta": counter_delta(before, after, "rx_packets_raw"),
+            "tx_packets_delta": counter_delta(before, after, "tx_packets_raw"),
+            "rx_errors_delta": counter_delta(before, after, "rx_errors_raw"),
+            "tx_errors_delta": counter_delta(before, after, "tx_errors_raw"),
+            "rx_discards_delta": counter_delta(before, after, "rx_discards_raw"),
+            "tx_discards_delta": counter_delta(before, after, "tx_discards_raw"),
+            "end_info": after,
+        }
+        if result["rx_bytes_delta"] is not None:
+            result["rx_avg_bps"] = (result["rx_bytes_delta"] * 8) / duration
+        else:
+            result["rx_avg_bps"] = None
+        if result["tx_bytes_delta"] is not None:
+            result["tx_avg_bps"] = (result["tx_bytes_delta"] * 8) / duration
+        else:
+            result["tx_avg_bps"] = None
+
+        result["rx_transfer"] = format_interface_delta(result["rx_bytes_delta"], result["rx_packets_delta"])
+        result["tx_transfer"] = format_interface_delta(result["tx_bytes_delta"], result["tx_packets_delta"])
+        result["rx_rate"] = format_bits_per_second(result["rx_avg_bps"])
+        result["tx_rate"] = format_bits_per_second(result["tx_avg_bps"])
+        result["error_delta"] = (
+            f"RX {format_count_delta(result['rx_errors_delta'])}; TX {format_count_delta(result['tx_errors_delta'])}"
+        )
+        result["discard_delta"] = (
+            f"RX {format_count_delta(result['rx_discards_delta'])}; TX {format_count_delta(result['tx_discards_delta'])}"
+        )
+        result["diagnosis"] = adapter_counter_watch_diagnosis(result)
+        self.result_ready.emit(result)
 
 
 class DnsLookupWorker(QThread):
@@ -2316,6 +2466,12 @@ class PingerApp(QWidget):
         self.adapter_labels = {}
         self.adapter_status_label = None
         self.adapter_refresh_btn = None
+        self.adapter_watch_duration_spin = None
+        self.adapter_watch_run_btn = None
+        self.adapter_watch_stop_btn = None
+        self.adapter_watch_labels = {}
+        self.adapter_counter_watch_worker = None
+        self.adapter_watch_last_result = None
         self.adapter_diagnosis_box = None
         self.adapter_info_btn = QPushButton("Adapter Info")
         self.adapter_info_btn.setFixedSize(135, 30)
@@ -3424,7 +3580,22 @@ class PingerApp(QWidget):
             controls = QHBoxLayout()
             self.adapter_refresh_btn = QPushButton("Refresh Adapter Info")
             self.adapter_refresh_btn.clicked.connect(self.refresh_adapter_info)
+            self.adapter_watch_duration_spin = QSpinBox()
+            self.adapter_watch_duration_spin.setRange(5, 300)
+            self.adapter_watch_duration_spin.setValue(30)
+            self.adapter_watch_duration_spin.setSuffix(" sec")
+            self.adapter_watch_duration_spin.setToolTip("How long to watch adapter counters for changes.")
+            self.adapter_watch_run_btn = QPushButton("Run Counter Watch")
+            self.adapter_watch_run_btn.setToolTip("Measure transfer, errors, and discards over the selected duration.")
+            self.adapter_watch_run_btn.clicked.connect(self.start_adapter_counter_watch)
+            self.adapter_watch_stop_btn = QPushButton("Stop Watch")
+            self.adapter_watch_stop_btn.setEnabled(False)
+            self.adapter_watch_stop_btn.clicked.connect(self.stop_adapter_counter_watch)
             controls.addWidget(self.adapter_refresh_btn)
+            controls.addWidget(QLabel("Watch duration"))
+            controls.addWidget(self.adapter_watch_duration_spin)
+            controls.addWidget(self.adapter_watch_run_btn)
+            controls.addWidget(self.adapter_watch_stop_btn)
             controls.addStretch(1)
             layout.addLayout(controls)
 
@@ -3504,6 +3675,39 @@ class PingerApp(QWidget):
             counters_group.setLayout(counters)
             layout.addWidget(counters_group)
 
+            watch_group = QGroupBox("Counter Watch Result")
+            watch = QGridLayout()
+            watch.setContentsMargins(10,10,10,10)
+            watch.setHorizontalSpacing(12)
+            watch.setVerticalSpacing(8)
+            watch_fields = [
+                ("duration", "Duration"),
+                ("received_delta", "Received During Watch"),
+                ("sent_delta", "Sent During Watch"),
+                ("receive_rate", "Avg Receive Rate"),
+                ("send_rate", "Avg Send Rate"),
+                ("error_delta", "Error Increase"),
+                ("discard_delta", "Discard Increase"),
+            ]
+            self.adapter_watch_labels = {}
+            for row, (key, label_text) in enumerate(watch_fields):
+                name = QLabel(label_text)
+                value = QLabel("N/A")
+                value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setMinimumHeight(26)
+                value.setStyleSheet(
+                    "QLabel { background: #ffffff; border: 1px solid #d4d7dc; "
+                    "border-radius: 3px; padding: 4px 6px; }"
+                )
+                self.adapter_watch_labels[key] = value
+                watch.addWidget(name, row // 2, (row % 2) * 2)
+                watch.addWidget(value, row // 2, (row % 2) * 2 + 1)
+            watch.setColumnStretch(1, 1)
+            watch.setColumnStretch(3, 1)
+            watch_group.setLayout(watch)
+            layout.addWidget(watch_group)
+
             diagnosis_group = QGroupBox("Diagnosis")
             diagnosis_layout = QVBoxLayout()
             self.adapter_diagnosis_box = QTextEdit()
@@ -3524,8 +3728,12 @@ class PingerApp(QWidget):
     def refresh_adapter_info(self):
         if self.adapter_info_worker is not None and self.adapter_info_worker.isRunning():
             return
+        if self.adapter_counter_watch_worker is not None and self.adapter_counter_watch_worker.isRunning():
+            return
         if self.adapter_refresh_btn is not None:
             self.adapter_refresh_btn.setEnabled(False)
+        if self.adapter_watch_run_btn is not None:
+            self.adapter_watch_run_btn.setEnabled(False)
         if self.adapter_status_label is not None:
             self.adapter_status_label.setText("Reading active adapter details...")
             self.adapter_status_label.setStyleSheet(
@@ -3546,6 +3754,11 @@ class PingerApp(QWidget):
             value = str(info.get(key, "N/A") or "N/A")
             label.setText(value)
             label.setToolTip(value)
+        if self.adapter_watch_labels:
+            for label in self.adapter_watch_labels.values():
+                label.setText("N/A")
+                label.setToolTip("N/A")
+        self.adapter_watch_last_result = None
         diagnosis = info.get("diagnosis", "N/A")
         if self.adapter_diagnosis_box is not None:
             self.adapter_diagnosis_box.setPlainText(diagnosis)
@@ -3594,6 +3807,111 @@ class PingerApp(QWidget):
     def _finish_adapter_info(self):
         if self.adapter_refresh_btn is not None:
             self.adapter_refresh_btn.setEnabled(True)
+        if self.adapter_watch_run_btn is not None:
+            self.adapter_watch_run_btn.setEnabled(True)
+
+    def start_adapter_counter_watch(self):
+        if self.adapter_counter_watch_worker is not None and self.adapter_counter_watch_worker.isRunning():
+            return
+        if self.adapter_info_worker is not None and self.adapter_info_worker.isRunning():
+            return
+
+        duration = self.adapter_watch_duration_spin.value() if self.adapter_watch_duration_spin is not None else 30
+        for label in self.adapter_watch_labels.values():
+            label.setText("N/A")
+            label.setToolTip("N/A")
+        self.adapter_watch_last_result = None
+        if self.adapter_refresh_btn is not None:
+            self.adapter_refresh_btn.setEnabled(False)
+        if self.adapter_watch_run_btn is not None:
+            self.adapter_watch_run_btn.setEnabled(False)
+        if self.adapter_watch_stop_btn is not None:
+            self.adapter_watch_stop_btn.setEnabled(True)
+        if self.adapter_watch_duration_spin is not None:
+            self.adapter_watch_duration_spin.setEnabled(False)
+        self._set_adapter_status("Counter Watch starting...", "running")
+
+        self.adapter_counter_watch_worker = AdapterCounterWatchWorker(duration)
+        self.adapter_counter_watch_worker.status_ready.connect(lambda message: self._set_adapter_status(message, "running"))
+        self.adapter_counter_watch_worker.result_ready.connect(self._set_adapter_counter_watch_result)
+        self.adapter_counter_watch_worker.error_ready.connect(self._set_adapter_counter_watch_error)
+        self.adapter_counter_watch_worker.finished.connect(self._finish_adapter_counter_watch)
+        self.adapter_counter_watch_worker.finished.connect(self.adapter_counter_watch_worker.deleteLater)
+        self.adapter_counter_watch_worker.finished.connect(lambda: setattr(self, "adapter_counter_watch_worker", None))
+        self.adapter_counter_watch_worker.start()
+
+    def stop_adapter_counter_watch(self):
+        if self.adapter_counter_watch_worker is not None and self.adapter_counter_watch_worker.isRunning():
+            self.adapter_counter_watch_worker.stop()
+            self._set_adapter_status("Stopping Counter Watch...", "running")
+
+    def _set_adapter_status(self, message: str, level="info"):
+        if self.adapter_status_label is None:
+            return
+        styles = {
+            "info": ("#eef2f7", "#3c4043", "#b7c0cc"),
+            "running": ("#fff4ce", "#8a5a00", "#d8b756"),
+            "ok": ("#e6f4ea", "#137333", "#8abf9a"),
+            "error": ("#fce8e6", "#a50e0e", "#d28b82"),
+        }
+        bg, fg, border = styles.get(level, styles["info"])
+        self.adapter_status_label.setText(message)
+        self.adapter_status_label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 4px; padding: 8px; font-weight: bold; }"
+        )
+
+    def _set_adapter_counter_watch_result(self, result: dict):
+        self.adapter_watch_last_result = result
+        end_info = result.get("end_info", {})
+        for key, label in self.adapter_labels.items():
+            value = str(end_info.get(key, "N/A") or "N/A")
+            label.setText(value)
+            label.setToolTip(value)
+
+        values = {
+            "duration": f"{result.get('duration_sec', 'N/A')} sec",
+            "received_delta": result.get("rx_transfer", "N/A"),
+            "sent_delta": result.get("tx_transfer", "N/A"),
+            "receive_rate": result.get("rx_rate", "N/A"),
+            "send_rate": result.get("tx_rate", "N/A"),
+            "error_delta": result.get("error_delta", "N/A"),
+            "discard_delta": result.get("discard_delta", "N/A"),
+        }
+        for key, value in values.items():
+            label = self.adapter_watch_labels.get(key)
+            if label is not None:
+                label.setText(str(value))
+                label.setToolTip(str(value))
+
+        base_diagnosis = end_info.get("diagnosis", "N/A")
+        watch_diagnosis = result.get("diagnosis", "N/A")
+        if self.adapter_diagnosis_box is not None:
+            self.adapter_diagnosis_box.setPlainText(f"{base_diagnosis}\n\nCounter Watch:\n{watch_diagnosis}")
+
+        error_delta = sum(value or 0 for value in (
+            result.get("rx_errors_delta"),
+            result.get("tx_errors_delta"),
+            result.get("rx_discards_delta"),
+            result.get("tx_discards_delta"),
+        ))
+        level = "error" if error_delta > 0 else "ok"
+        self._set_adapter_status("Counter Watch completed.", level)
+
+    def _set_adapter_counter_watch_error(self, message: str):
+        if self.adapter_diagnosis_box is not None:
+            self.adapter_diagnosis_box.setPlainText(message)
+        self._set_adapter_status(message, "error")
+
+    def _finish_adapter_counter_watch(self):
+        if self.adapter_refresh_btn is not None:
+            self.adapter_refresh_btn.setEnabled(True)
+        if self.adapter_watch_run_btn is not None:
+            self.adapter_watch_run_btn.setEnabled(True)
+        if self.adapter_watch_stop_btn is not None:
+            self.adapter_watch_stop_btn.setEnabled(False)
+        if self.adapter_watch_duration_spin is not None:
+            self.adapter_watch_duration_spin.setEnabled(True)
 
     def show_lan_throughput_window(self):
         """Open the iperf3 LAN throughput diagnostic window."""
@@ -5050,6 +5368,7 @@ class PingerApp(QWidget):
             <li>If Link Speed is <code>100 Mbps</code>, speed tests cannot reach gigabit speeds from this PC. Check cable, wall socket, switch/router port, USB dock, adapter settings, and auto-negotiation.</li>
             <li>If Link Speed is <code>1 Gbps</code> or faster but internet speed is near 100 Mbps, check router WAN/LAN port speed, ISP profile, speed test server, or congestion.</li>
             <li><b>Receive/Transmit Errors</b> and <b>Discards</b> should normally stay at zero or stop increasing. Increasing values during tests can indicate cable, port, NIC, driver, or congestion issues.</li>
+            <li><b>Counter Watch</b>: run this while a Speed Test or LAN Throughput test is active. It compares before/after counters and shows transfer, average rates, and error/discard increases.</li>
             <li>For Wi-Fi, link rate is not the same as real throughput. Signal, band, channel width, interference, and access point capability matter.</li>
         </ul>
 
@@ -5335,6 +5654,18 @@ class PingerApp(QWidget):
         ]
         lines.extend(["", "Interface Counters:"])
         lines.extend(f"{label}: {self._label_text(self.adapter_labels.get(key))}" for label, key in counter_rows)
+        if self.adapter_watch_labels:
+            watch_rows = [
+                ("Duration", "duration"),
+                ("Received During Watch", "received_delta"),
+                ("Sent During Watch", "sent_delta"),
+                ("Avg Receive Rate", "receive_rate"),
+                ("Avg Send Rate", "send_rate"),
+                ("Error Increase", "error_delta"),
+                ("Discard Increase", "discard_delta"),
+            ]
+            lines.extend(["", "Counter Watch:"])
+            lines.extend(f"{label}: {self._label_text(self.adapter_watch_labels.get(key))}" for label, key in watch_rows)
         if self.adapter_diagnosis_box is not None:
             diagnosis = self.adapter_diagnosis_box.toPlainText().strip()
             if diagnosis:
