@@ -63,6 +63,7 @@
 - Fixed the packaged app PyQt/SIP startup crash by moving packaging to a dedicated stable Python 3.13 environment.
 - Added a packaging environment setup script and rebuilt `installer_output\PingerAppSetup-0.1.0.exe` from the corrected PyInstaller output.
 - Added 0.1.0 release notes, installer checksum record, README download/security notes, and a security policy.
+- Added GPL-3.0-only project license notice and PyQt5/Qt third-party notice for public distribution.
 
 ## 2026-05-07
 

@@ -15,7 +15,7 @@ https://github.com/Grzybkins/PingerAPP/releases
 For version `0.1.0`, download `PingerAppSetup-0.1.0.exe` and verify the checksum:
 
 ```text
-SHA256 AEB4E2AA445462D2B1FC93906DD5321AFD40D8A458C84D4A8DFA33F2BFDD9564
+SHA256 F27DD934522CE6BCD09F4198D50D78094D54023C5320B10AF443292E8B9BB340
 ```
 
 The installer is currently unsigned, so Windows SmartScreen may show a warning.
@@ -61,7 +61,9 @@ PingerApp is a local troubleshooting tool and does not require accounts, API key
 
 Only run Network Scanner against networks and hosts you own or are authorized to troubleshoot. Security reporting guidance is in `SECURITY.md`.
 
-No open-source project license has been selected yet. Add a `LICENSE` file before presenting the repository as open-source.
+## License
+
+PingerApp source code is licensed under GPL-3.0-only. This matches the GPL distribution path for PyQt5. Third-party components remain under their own licenses; see `THIRD_PARTY_NOTICES.md`.
 
 ## LibreSpeed Speed Test
 

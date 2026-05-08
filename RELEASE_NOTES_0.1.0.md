@@ -13,7 +13,7 @@ PingerAppSetup-0.1.0.exe
 SHA256:
 
 ```text
-AEB4E2AA445462D2B1FC93906DD5321AFD40D8A458C84D4A8DFA33F2BFDD9564
+F27DD934522CE6BCD09F4198D50D78094D54023C5320B10AF443292E8B9BB340
 ```
 
 The installer was built with:
@@ -48,3 +48,4 @@ Tested locally:
 - Raw ICMP ping can require elevated network permissions on some systems.
 - Only run Network Scanner against networks and hosts you own or are authorized to troubleshoot.
 - Keep `THIRD_PARTY_NOTICES.md` with the release.
+- PingerApp source code is GPL-3.0-only because the packaged app uses the GPL distribution path for PyQt5.

@@ -125,7 +125,7 @@ installer_output\PingerAppSetup-0.1.0.exe
 The local installer build has been verified with Inno Setup 6.7.1. The latest generated installer was built from Python 3.13.7 and has this hash:
 
 ```text
-SHA256 AEB4E2AA445462D2B1FC93906DD5321AFD40D8A458C84D4A8DFA33F2BFDD9564
+SHA256 F27DD934522CE6BCD09F4198D50D78094D54023C5320B10AF443292E8B9BB340
 ```
 
 The installer copies the full `dist\PingerApp` folder, adds a Start Menu shortcut, offers an optional desktop shortcut, and copies `README.md` plus `THIRD_PARTY_NOTICES.md` to the install root.

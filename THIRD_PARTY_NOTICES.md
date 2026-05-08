@@ -1,5 +1,16 @@
 # Third-Party Notices
 
+## PyQt5 and Qt
+
+PingerApp uses PyQt5 for its Windows desktop interface.
+
+- PyQt project: https://riverbankcomputing.com/software/pyqt
+- PyQt license path used here: GNU General Public License v3.0
+- Qt runtime: bundled through PyQt5 wheels for packaged Windows builds
+- Purpose: desktop user interface framework
+
+PyQt is dual licensed under GPL v3 and a Riverbank commercial license. PingerApp is distributed under GPL-3.0-only to align with the GPL PyQt5 distribution path.
+
 ## LibreSpeed CLI
 
 PingerApp can use LibreSpeed CLI for internet speed tests.

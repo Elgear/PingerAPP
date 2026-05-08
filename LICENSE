@@ -1,0 +1,12 @@
+PingerApp License Notice
+========================
+
+PingerApp source code is licensed under the GNU General Public License version 3.0 only.
+
+SPDX-License-Identifier: GPL-3.0-only
+
+The official GPLv3 license text is available from the Free Software Foundation:
+
+https://www.gnu.org/licenses/gpl-3.0.html
+
+Third-party components remain under their own licenses. See THIRD_PARTY_NOTICES.md and the bundled license files under tools/.
