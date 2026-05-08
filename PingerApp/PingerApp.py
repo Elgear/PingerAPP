@@ -204,20 +204,26 @@ class SpeedTestWorker(QThread):
             self.error_ready.emit(message)
             return
 
-        output = completed.stdout.strip()
-        object_start = output.find("{")
-        array_start = output.find("[")
-        starts = [pos for pos in (object_start, array_start) if pos != -1]
-        start = min(starts) if starts else -1
-        end = output.rfind("]" if start == array_start else "}")
-        if start == -1 or end == -1 or end <= start:
-            self.error_ready.emit("LibreSpeed CLI did not return JSON output.")
-            return
-
         try:
-            parsed = json.loads(output[start:end+1])
+            parsed = json.loads(completed.stdout.strip())
         except json.JSONDecodeError as e:
-            self.error_ready.emit(f"Could not parse LibreSpeed JSON: {e}")
+            output = completed.stdout.strip()
+            object_start = output.find("{")
+            array_start = output.find("[")
+            starts = [pos for pos in (object_start, array_start) if pos != -1]
+            start = min(starts) if starts else -1
+            end = output.rfind("]" if start == array_start else "}")
+            if start == -1 or end == -1 or end <= start:
+                self.error_ready.emit("LibreSpeed CLI did not return JSON output.")
+                return
+            try:
+                parsed = json.loads(output[start:end+1])
+            except json.JSONDecodeError:
+                self.error_ready.emit(f"Could not parse LibreSpeed JSON: {e}")
+                return
+
+        if parsed is None:
+            self.error_ready.emit("LibreSpeed returned no result for the selected server. Try Auto or another server.")
             return
 
         if isinstance(parsed, list):
@@ -225,6 +231,10 @@ class SpeedTestWorker(QThread):
                 self.error_ready.emit("LibreSpeed CLI returned an empty result list.")
                 return
             parsed = parsed[0]
+
+        if parsed is None:
+            self.error_ready.emit("LibreSpeed returned no result for the selected server. Try Auto or another server.")
+            return
 
         if not isinstance(parsed, dict):
             self.error_ready.emit("LibreSpeed CLI returned an unsupported JSON shape.")
@@ -1061,6 +1071,8 @@ class PingerApp(QWidget):
         self.speedtest_window.show()
         self.speedtest_window.raise_()
         self.speedtest_window.activateWindow()
+        if self.speedtest_server_combo is not None and self.speedtest_server_combo.count() == 1:
+            QTimer.singleShot(0, self.refresh_speedtest_servers)
 
     def _speedtest_candidate_roots(self):
         roots = []
@@ -1192,6 +1204,7 @@ class PingerApp(QWidget):
             return
 
         self._set_speedtest_status("Running speed test. This may use significant bandwidth...")
+        self._reset_speedtest_current_results()
         server_id = self.speedtest_server_combo.currentData() if self.speedtest_server_combo is not None else None
         duration = self.speedtest_duration_spin.value() if self.speedtest_duration_spin is not None else 15
         share = self.speedtest_share_check.isChecked() if self.speedtest_share_check is not None else False
@@ -1204,6 +1217,10 @@ class PingerApp(QWidget):
         self.speedtest_worker.finished.connect(self.speedtest_worker.deleteLater)
         self.speedtest_worker.finished.connect(lambda: setattr(self, "speedtest_worker", None))
         self.speedtest_worker.start()
+
+    def _reset_speedtest_current_results(self):
+        for label in self.speedtest_labels.values():
+            label.setText("N/A")
 
     def _set_speedtest_status(self, message: str):
         if self.speedtest_status_label is not None:
@@ -1315,14 +1332,19 @@ class PingerApp(QWidget):
             self.speedtest_history_table.removeRow(self.speedtest_history_table.rowCount() - 1)
 
     def _set_speedtest_error(self, message: str):
+        self._stop_speedtest_progress(reset=True)
         self._set_speedtest_status(f"Speed test failed: {message}")
 
     def _finish_speedtest(self):
-        self._stop_speedtest_progress(reset=False)
+        failed = self.speedtest_status_label is not None and self.speedtest_status_label.text().startswith("Speed test failed")
+        if not failed:
+            self._stop_speedtest_progress(reset=False)
         if self.speedtest_progress_bar is not None:
             if self.speedtest_status_label is not None and self.speedtest_status_label.text().startswith("Speed test completed"):
                 self.speedtest_progress_bar.setValue(100)
                 self.speedtest_progress_bar.setFormat("Complete")
+            elif failed:
+                self.speedtest_progress_bar.setFormat("Failed")
             else:
                 self.speedtest_progress_bar.setFormat("Stopped")
         self._set_speedtest_controls_enabled(True)

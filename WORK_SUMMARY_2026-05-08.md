@@ -23,6 +23,7 @@
 - Bundled LibreSpeed CLI v1.0.13 for Windows x64 with checksum and LGPL-3.0 attribution notes.
 - Added LibreSpeed server refresh/selection, configurable duration, optional share URL generation, test timestamp, data used, and server URL display.
 - Removed the LibreSpeed packet-loss row, added Speed Test run history, and added a duration-based running progress bar.
+- Auto-loaded the LibreSpeed server list on Speed Test open and added clearer handling for selected servers that return no result.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 
