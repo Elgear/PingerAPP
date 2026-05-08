@@ -9,7 +9,7 @@ The Ping Panel supports saved Host presets so common gateways, public targets, a
 Windows builds are published from GitHub Releases:
 
 ```text
-https://github.com/Grzybkins/PingerAPP/releases
+https://github.com/Elgear/PingerAPP/releases
 ```
 
 For version `0.1.0`, download `PingerAppSetup-0.1.0.exe` and verify the checksum:

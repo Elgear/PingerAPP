@@ -48,7 +48,7 @@ git push origin v0.1.0
 Open:
 
 ```text
-https://github.com/Grzybkins/PingerAPP/releases/new
+https://github.com/Elgear/PingerAPP/releases/new
 ```
 
 Create the release:
