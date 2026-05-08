@@ -2,6 +2,8 @@
 
 PyQt5 desktop tool for monitoring latency, packet loss, jitter, DNS lookups, and traceroute output.
 
+The Ping Panel supports saved Host presets so common gateways, public targets, and service IPs can be reused without retyping.
+
 ## Setup
 
 ```powershell
@@ -32,7 +34,7 @@ The right-side Tools panel opens separate diagnostic windows:
 - MTU Test: find the largest non-fragmenting ping payload and estimated path MTU, with raw ping output details.
 - Traceroute: target, max-hop, and timeout controls with structured hop output plus raw traceroute text.
 - Alerts: threshold alert log.
-- Report: selectable troubleshooting report with preview and `.txt` export for Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Wi-Fi Diagnostics, Speed Targets, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results.
+- Report: selectable troubleshooting report with preview, `.txt` export, and spreadsheet-friendly `.csv` export for Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Wi-Fi Diagnostics, Speed Targets, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results.
 - Help: offline field guide explaining the main panels, controls, graph readings, tool workflows, report output, and common diagnostic meanings.
 
 MAC addresses can only be discovered when the target exposes them on the local network path. Routed hosts usually show no MAC address, or only the next-hop device in the local ARP cache.

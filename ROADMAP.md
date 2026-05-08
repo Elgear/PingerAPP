@@ -48,7 +48,9 @@ Network Scanner replaces the original Port Check idea. Do not add a separate Por
 - DNS Compare: hostname input, record type selector, System/Cloudflare/Google/Quad9 resolver comparison, response timing, answers, and error details using `nslookup`.
 - MTU Test: target input, start/max payload, Windows-first `ping -f -l` probing, largest non-fragmenting payload, estimated MTU, and raw ping output/details.
 - Report: selectable sections for Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Speed Test history, last DNS lookup, last traceroute, and Network Scanner results, with preview and `.txt` save.
+- Report CSV Export: selected report sections can be exported to spreadsheet-friendly CSV, including structured rows for Speed Test history, Speed Targets, traceroute hops, and Network Scanner results.
 - Help: offline guide covering the main controls, threshold sliders, monitoring boxes, graphs, diagnostic tools, report builder, and common result interpretation.
+- Saved Target Presets: common Host targets can be saved, selected, and deleted from the Ping Panel.
 - Adapter Info: active adapter status, link speed, connection type, IPv4, gateway, DNS servers, MAC address, duplex setting where available, interface error/discard counters where available, timed Counter Watch transfer/error delta testing, and 100 Mbps vs gigabit/counter diagnosis.
 - LAN Throughput: bundled iperf3 client/server mode to separate local LAN throughput issues from internet, router WAN, ISP profile, or speed test server issues.
 - Gateway Stability: repeated first-hop ping monitor for gateway latency, packet loss, jitter, spikes, raw ping log, and local-vs-upstream diagnosis.
@@ -84,7 +86,6 @@ Also extract latency, loss, jitter, health, and alert calculations into testable
 
 ## Later Ideas
 
-- Saved target presets.
-- CSV export for ping history, alert logs, speed test history, and scanner results.
+- CSV export for alert logs and full ping sample history.
 - Selectable ping interval.
 - Compact always-on-top monitor mode.

@@ -13,6 +13,7 @@ import urllib.parse
 import ping3
 import math
 import json
+import csv
 import os
 import shutil
 import time
@@ -2760,6 +2761,19 @@ class PingerApp(QWidget):
         self.host_input = QLineEdit("8.8.8.8")
         self.host_input.setToolTip("Enter IP or hostname to ping")
         self.host_input.setAlignment(Qt.AlignCenter)
+        self.target_presets = []
+        self.target_preset_combo = QComboBox()
+        self.target_preset_combo.setToolTip("Saved ping targets. Select one to load it into Host.")
+        self.target_preset_combo.setFixedSize(170, 30)
+        self.target_preset_combo.activated.connect(self.apply_target_preset)
+        self.target_save_btn = QPushButton("Save")
+        self.target_save_btn.setFixedSize(58, 30)
+        self.target_save_btn.setToolTip("Save the current Host value as a target preset.")
+        self.target_save_btn.clicked.connect(self.save_current_target_preset)
+        self.target_delete_btn = QPushButton("Del")
+        self.target_delete_btn.setFixedSize(48, 30)
+        self.target_delete_btn.setToolTip("Delete the selected target preset.")
+        self.target_delete_btn.clicked.connect(self.delete_target_preset)
 
         self.start_btn = QPushButton("Start")
         self.start_btn.setFixedSize(100,30)
@@ -3283,6 +3297,14 @@ class PingerApp(QWidget):
                 target_h.addSpacing(26)
             elif index == 2:
                 target_h.addSpacing(10)
+        preset_v = QVBoxLayout(); preset_v.setSpacing(2)
+        preset_v.addWidget(QLabel("Preset"), 0, Qt.AlignCenter)
+        preset_row = QHBoxLayout(); preset_row.setSpacing(4)
+        preset_row.addWidget(self.target_preset_combo)
+        preset_row.addWidget(self.target_save_btn)
+        preset_row.addWidget(self.target_delete_btn)
+        preset_v.addLayout(preset_row)
+        target_h.insertLayout(1, preset_v)
         target_group.setLayout(target_h)
 
         live_group = QGroupBox("Live Status")
@@ -3508,6 +3530,7 @@ class PingerApp(QWidget):
         self.lat_exceed_count = 0
         self.loss_exceed_count= 0
         self.prev_loss_pct    = 0.0
+        self._load_target_presets()
         self.refresh_host_info()
 
 
@@ -3544,6 +3567,83 @@ class PingerApp(QWidget):
                 pass
         if getattr(ping3, "_socket", None) is sock:
             ping3._socket = None
+
+    def _data_file_path(self, filename: str):
+        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+        return os.path.join(root, "data", filename)
+
+    def _target_presets_path(self):
+        return self._data_file_path("target_presets.json")
+
+    def _load_target_presets(self):
+        path = self._target_presets_path()
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            loaded = []
+        self.target_presets = []
+        if isinstance(loaded, list):
+            for value in loaded:
+                target = str(value).strip()
+                if target and target not in self.target_presets:
+                    self.target_presets.append(target)
+        self._refresh_target_preset_combo()
+
+    def _save_target_presets(self):
+        path = self._target_presets_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(self.target_presets[:50], handle, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Target Presets", f"Could not save target presets:\n{e}")
+
+    def _refresh_target_preset_combo(self, selected=None):
+        if self.target_preset_combo is None:
+            return
+        self.target_preset_combo.blockSignals(True)
+        self.target_preset_combo.clear()
+        if not self.target_presets:
+            self.target_preset_combo.addItem("No saved targets", "")
+            self.target_preset_combo.setEnabled(False)
+            self.target_delete_btn.setEnabled(False)
+        else:
+            self.target_preset_combo.setEnabled(True)
+            self.target_delete_btn.setEnabled(True)
+            for target in self.target_presets:
+                self.target_preset_combo.addItem(target, target)
+            if selected in self.target_presets:
+                self.target_preset_combo.setCurrentIndex(self.target_presets.index(selected))
+        self.target_preset_combo.blockSignals(False)
+
+    def apply_target_preset(self, *_):
+        if self.target_preset_combo is None or not self.target_preset_combo.isEnabled():
+            return
+        target = str(self.target_preset_combo.currentData() or self.target_preset_combo.currentText()).strip()
+        if target:
+            self.host_input.setText(target)
+
+    def save_current_target_preset(self):
+        target = self.host_input.text().strip()
+        if not target:
+            QMessageBox.warning(self, "Target Presets", "Enter a Host value before saving a preset.")
+            return
+        if target not in self.target_presets:
+            self.target_presets.append(target)
+            self.target_presets = self.target_presets[-50:]
+            self._save_target_presets()
+        self._refresh_target_preset_combo(selected=target)
+
+    def delete_target_preset(self):
+        if self.target_preset_combo is None or not self.target_presets:
+            return
+        target = str(self.target_preset_combo.currentData() or "").strip()
+        if not target:
+            return
+        self.target_presets = [item for item in self.target_presets if item != target]
+        self._save_target_presets()
+        self._refresh_target_preset_combo()
 
     def refresh_host_info(self):
         """Refresh network labels without freezing the window."""
@@ -6730,6 +6830,7 @@ class PingerApp(QWidget):
         <h3>Ping Panel</h3>
         <ul>
             <li><b>Host</b>: hostname or IP address used by the ping monitor and as the default target for tools.</li>
+            <li><b>Preset</b>: saved Host targets. Select one to load it, Save stores the current Host, and Del removes the selected preset.</li>
             <li><b>Reverse DNS</b>: hostname found for the current target IP when available.</li>
             <li><b>Start/Stop</b>: starts or stops the continuous ping session.</li>
             <li><b>Pause/Resume</b>: pauses the session timer and ping loop without clearing current stats.</li>
@@ -6909,7 +7010,7 @@ class PingerApp(QWidget):
             <li>Builds a plain text troubleshooting snapshot from selected sections.</li>
             <li>Use checkboxes to include or exclude Host Info, Adapter Info, ping stats, LAN Throughput, Gateway Stability, Loaded Latency, Route Health, Wi-Fi Diagnostics, Speed Targets, Speed Test history, DNS lookup, traceroute, and Network Scanner results.</li>
             <li><b>Refresh Preview</b> rebuilds the snapshot from current app data.</li>
-            <li><b>Save as TXT</b> writes the current report to a text file.</li>
+            <li><b>Save as TXT</b> writes the current report to a text file. <b>Export CSV</b> writes selected report data in spreadsheet-friendly rows.</li>
         </ul>
 
         <div class="warn">
@@ -6968,8 +7069,11 @@ class PingerApp(QWidget):
             refresh_btn.clicked.connect(self.update_report_preview)
             save_btn = QPushButton("Save as TXT")
             save_btn.clicked.connect(self.save_report)
+            csv_btn = QPushButton("Export CSV")
+            csv_btn.clicked.connect(self.save_report_csv)
             action_row.addWidget(refresh_btn)
             action_row.addWidget(save_btn)
+            action_row.addWidget(csv_btn)
             action_row.addStretch(1)
             layout.addLayout(action_row)
 
@@ -6995,9 +7099,8 @@ class PingerApp(QWidget):
         if self.report_preview_box is not None:
             self.report_preview_box.setPlainText(report_text)
 
-        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
         default_name = f"PingerApp_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        default_path = os.path.join(root, "data", default_name)
+        default_path = self._data_file_path(default_name)
         path, _ = QFileDialog.getSaveFileName(
             self.report_window or self,
             "Save Report",
@@ -7018,6 +7121,40 @@ class PingerApp(QWidget):
             QMessageBox.critical(self.report_window or self, "Report Error", f"Could not save report:\n{e}")
             return
         QMessageBox.information(self.report_window or self, "Report Saved", f"Saved report to:\n{path}")
+
+    def save_report_csv(self):
+        rows = self.build_report_csv_rows()
+        default_name = f"PingerApp_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default_path = self._data_file_path(default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self.report_window or self,
+            "Export Report CSV",
+            default_path,
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".csv"
+
+        headers = [
+            "section", "record_type", "field", "value", "target", "host",
+            "hostname", "mac", "port", "service", "state", "latency",
+            "jitter", "download", "upload", "details", "timestamp",
+        ]
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in headers})
+        except OSError as e:
+            QMessageBox.critical(self.report_window or self, "CSV Export Error", f"Could not export CSV:\n{e}")
+            return
+        QMessageBox.information(self.report_window or self, "CSV Exported", f"Exported CSV to:\n{path}")
 
     def _report_section_enabled(self, key: str):
         checkbox = self.report_checkboxes.get(key)
@@ -7051,6 +7188,128 @@ class PingerApp(QWidget):
                 continue
             self._append_report_section(lines, title, builder())
         return "\n".join(lines).rstrip() + "\n"
+
+    def build_report_csv_rows(self):
+        rows = []
+        target = self.host_input.text().strip() or "N/A"
+
+        def add(section, record_type, **values):
+            row = {key: "" for key in (
+                "section", "record_type", "field", "value", "target", "host",
+                "hostname", "mac", "port", "service", "state", "latency",
+                "jitter", "download", "upload", "details", "timestamp",
+            )}
+            row.update({"section": section, "record_type": record_type, "target": target})
+            row.update(values)
+            rows.append(row)
+
+        generic_sections = [
+            ("host_info", "Host Info", self._report_host_info_lines),
+            ("adapter_info", "Adapter Info", self._report_adapter_info_lines),
+            ("ping_stats", "Ping Stats", self._report_ping_stats_lines),
+            ("lan_throughput", "LAN Throughput", self._report_lan_throughput_lines),
+            ("gateway_stability", "Gateway Stability", self._report_gateway_stability_lines),
+            ("loaded_latency", "Loaded Latency", self._report_loaded_latency_lines),
+            ("route_health", "Route Health", self._report_route_health_lines),
+            ("wifi_diagnostics", "Wi-Fi Diagnostics", self._report_wifi_diagnostics_lines),
+            ("dns_lookup", "Last DNS Lookup", self._report_dns_lookup_lines),
+        ]
+        for key, title, builder in generic_sections:
+            if not self._report_section_enabled(key):
+                continue
+            for line in builder():
+                clean = str(line).strip()
+                if not clean:
+                    continue
+                if ": " in clean and not clean.startswith("  "):
+                    field, value = clean.split(": ", 1)
+                    add(title, "field", field=field.strip(), value=value.strip())
+                else:
+                    add(title, "detail", details=clean)
+
+        if self._report_section_enabled("speed_targets"):
+            if self.speed_targets_last_result:
+                for item in self.speed_targets_last_result.get("results", []):
+                    add(
+                        "Speed Targets",
+                        "speed_target",
+                        field=str(item.get("id", "")),
+                        value=str(item.get("name", "N/A")),
+                        download=str(item.get("download_text", "N/A")),
+                        upload=str(item.get("upload_text", "N/A")),
+                        latency=str(item.get("latency_text", "N/A")),
+                        jitter=str(item.get("jitter_text", "N/A")),
+                        details=str(item.get("error", "") or item.get("url", "")),
+                    )
+                add("Speed Targets", "diagnosis", field="Diagnosis", value=self.speed_targets_last_result.get("diagnosis", "N/A"))
+            else:
+                add("Speed Targets", "detail", details="No Speed Targets result available.")
+
+        if self._report_section_enabled("speedtest_history"):
+            history_rows = self._speedtest_history_rows()
+            if not history_rows:
+                path = self._speedtest_history_path()
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        loaded = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    loaded = []
+                history_rows = [row for row in loaded if isinstance(row, list)]
+            for row in history_rows[:10]:
+                padded = [str(value) for value in row[:7]]
+                padded.extend([""] * (7 - len(padded)))
+                add(
+                    "Speed Test History",
+                    "speed_test",
+                    value=padded[5],
+                    download=padded[1],
+                    upload=padded[2],
+                    latency=padded[3],
+                    jitter=padded[4],
+                    details=padded[6],
+                    timestamp=padded[0],
+                )
+            if not history_rows:
+                add("Speed Test History", "detail", details="No Speed Test history available.")
+
+        if self._report_section_enabled("traceroute"):
+            trace_rows = self._table_rows(self.tr_table)
+            for row in trace_rows:
+                padded = [str(value) for value in row[:4]]
+                padded.extend([""] * (4 - len(padded)))
+                add(
+                    "Last Traceroute",
+                    "hop",
+                    field=padded[0],
+                    host=padded[1],
+                    hostname=padded[2],
+                    latency=padded[3],
+                )
+            raw = self.trace_raw_box.toPlainText().strip() if self.trace_raw_box is not None else ""
+            if raw:
+                add("Last Traceroute", "raw", details=raw)
+            if not trace_rows and not raw:
+                add("Last Traceroute", "detail", details="No traceroute result available.")
+
+        if self._report_section_enabled("network_scanner"):
+            if self.port_scan_results:
+                for result in self.port_scan_results:
+                    add(
+                        "Network Scanner Results",
+                        "port_result",
+                        host=str(result.get("host", "")),
+                        hostname=str(result.get("hostname", "N/A")),
+                        mac=str(result.get("mac", "N/A")),
+                        port="" if result.get("port") in (None, "") else str(result.get("port")),
+                        service=str(result.get("service", "")),
+                        state=str(result.get("status", "")),
+                        latency="N/A" if result.get("latency") is None else f"{result.get('latency'):.1f} ms",
+                        details=clean_probe_text(str(result.get("error", "")), max_len=260),
+                    )
+            else:
+                add("Network Scanner Results", "detail", details="No Network Scanner results available.")
+
+        return rows
 
     def _append_report_section(self, lines, title, body_lines):
         lines.extend([title, "-" * len(title)])
@@ -7722,8 +7981,7 @@ class PingerApp(QWidget):
             return str(value)
 
     def _speedtest_history_path(self):
-        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
-        return os.path.join(root, "data", "speedtest_history.json")
+        return self._data_file_path("speedtest_history.json")
 
     def _dict_get_any(self, data: dict, *keys):
         for key in keys:
