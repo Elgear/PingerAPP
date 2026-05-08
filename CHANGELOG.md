@@ -7,6 +7,7 @@
 - Switched the Speed Test integration from Ookla Speedtest CLI to LibreSpeed CLI using JSON output with telemetry disabled.
 - Updated packaging notes to use `tools/librespeed/librespeed-cli.exe` and include LibreSpeed LGPL-3.0 attribution when bundled.
 - Bundled LibreSpeed CLI v1.0.13 for Windows x64 with its license and checksum record.
+- Fixed LibreSpeed throughput formatting so JSON download/upload values display as Mbps correctly.
 
 ## 2026-05-07
 

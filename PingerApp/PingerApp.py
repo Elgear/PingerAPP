@@ -998,7 +998,7 @@ class PingerApp(QWidget):
     def _format_mbps(self, value):
         if value is None:
             return "N/A"
-        return f"{(float(value) / 1_000_000):.2f} Mbps"
+        return f"{float(value):.2f} Mbps"
 
     def _dict_get_any(self, data: dict, *keys):
         for key in keys:
