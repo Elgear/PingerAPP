@@ -22,6 +22,7 @@
 - Updated the Speed Test worker to call LibreSpeed CLI JSON output with telemetry disabled.
 - Bundled LibreSpeed CLI v1.0.13 for Windows x64 with checksum and LGPL-3.0 attribution notes.
 - Added LibreSpeed server refresh/selection, configurable duration, optional share URL generation, test timestamp, data used, and server URL display.
+- Removed the LibreSpeed packet-loss row, added Speed Test run history, and added a duration-based running progress bar.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 

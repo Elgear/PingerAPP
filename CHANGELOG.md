@@ -9,6 +9,7 @@
 - Bundled LibreSpeed CLI v1.0.13 for Windows x64 with its license and checksum record.
 - Fixed LibreSpeed throughput formatting so JSON download/upload values display as Mbps correctly.
 - Added LibreSpeed server refresh/selection, duration control, optional share URL generation, test timestamp, data used, and server URL display.
+- Removed the LibreSpeed packet-loss row, added Speed Test run history, and added a duration-based running progress bar.
 
 ## 2026-05-07
 

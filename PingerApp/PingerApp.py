@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QMessageBox, QGroupBox, QSlider, QTextEdit,
-    QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox
+    QSizePolicy, QGridLayout, QComboBox, QCheckBox, QSpinBox, QProgressBar
 )
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -171,10 +171,11 @@ class SpeedTestWorker(QThread):
         cmd = [
             self.executable,
             "--json",
-            "--telemetry-level", "disabled",
             "--no-icmp",
             "--duration", str(self.duration),
         ]
+        if not self.share:
+            cmd.extend(["--telemetry-level", "disabled"])
         if self.server_id:
             cmd.extend(["--server", str(self.server_id)])
         if self.share:
@@ -306,6 +307,9 @@ class PingerApp(QWidget):
         self.start_worker = None
         self.speedtest_worker = None
         self.speedtest_server_worker = None
+        self.speedtest_progress_timer = None
+        self.speedtest_progress_elapsed_ms = 0
+        self.speedtest_progress_total_ms = 0
 
         # §3.A.a Host input & Start/Pause controls
         self.host_input = QLineEdit("8.8.8.8")
@@ -537,6 +541,8 @@ class PingerApp(QWidget):
         self.speedtest_server_combo = None
         self.speedtest_duration_spin = None
         self.speedtest_share_check = None
+        self.speedtest_progress_bar = None
+        self.speedtest_history_table = None
         self.speedtest_btn = QPushButton("Speed Test")
         self.speedtest_btn.setFixedSize(135, 30)
         self.speedtest_btn.setToolTip("Open internet speed test")
@@ -960,8 +966,8 @@ class PingerApp(QWidget):
             self.speedtest_duration_spin.setValue(15)
             self.speedtest_duration_spin.setSuffix(" sec")
 
-            self.speedtest_share_check = QCheckBox("Generate share URL")
-            self.speedtest_share_check.setToolTip("Disabled by default. Enables LibreSpeed share result generation.")
+            self.speedtest_share_check = QCheckBox("Try share URL")
+            self.speedtest_share_check.setToolTip("Disabled by default. Some LibreSpeed servers do not provide share URLs.")
 
             options_grid.addWidget(QLabel("Server"), 0, 0)
             options_grid.addWidget(self.speedtest_server_combo, 0, 1)
@@ -977,6 +983,13 @@ class PingerApp(QWidget):
             self.speedtest_run_btn.setMinimumHeight(34)
             self.speedtest_run_btn.clicked.connect(self.start_speed_test)
             layout.addWidget(self.speedtest_run_btn)
+
+            self.speedtest_progress_bar = QProgressBar()
+            self.speedtest_progress_bar.setRange(0, 100)
+            self.speedtest_progress_bar.setValue(0)
+            self.speedtest_progress_bar.setTextVisible(True)
+            self.speedtest_progress_bar.setFormat("Ready")
+            layout.addWidget(self.speedtest_progress_bar)
 
             def add_result_section(title, fields):
                 group = QGroupBox(title)
@@ -1010,7 +1023,6 @@ class PingerApp(QWidget):
             add_result_section("Quality", [
                 ("latency", "Latency"),
                 ("jitter", "Jitter"),
-                ("loss", "Packet Loss"),
             ])
             add_result_section("Endpoint", [
                 ("server", "Server"),
@@ -1022,6 +1034,24 @@ class PingerApp(QWidget):
                 ("timestamp", "Test Time"),
                 ("data_used", "Data Used"),
             ])
+
+            history_group = QGroupBox("History")
+            history_layout = QVBoxLayout()
+            history_layout.setContentsMargins(10,10,10,10)
+            self.speedtest_history_table = QTableWidget(0, 7)
+            self.speedtest_history_table.setHorizontalHeaderLabels([
+                "Time", "Down", "Up", "Latency", "Jitter", "Server", "Data"
+            ])
+            self.speedtest_history_table.verticalHeader().setVisible(False)
+            self.speedtest_history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.speedtest_history_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.speedtest_history_table.setMinimumHeight(150)
+            self.speedtest_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            self.speedtest_history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+            history_layout.addWidget(self.speedtest_history_table)
+            history_group.setLayout(history_layout)
+            layout.addWidget(history_group)
+
             self.speedtest_window.setLayout(layout)
 
         self.speedtest_window.layout().activate()
@@ -1104,6 +1134,50 @@ class PingerApp(QWidget):
         if self.speedtest_refresh_servers_btn is not None:
             self.speedtest_refresh_servers_btn.setEnabled(True)
 
+    def _set_speedtest_controls_enabled(self, enabled: bool):
+        for widget in (
+            self.speedtest_run_btn,
+            self.speedtest_refresh_servers_btn,
+            self.speedtest_server_combo,
+            self.speedtest_duration_spin,
+            self.speedtest_share_check,
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _start_speedtest_progress(self, duration_seconds: int):
+        self._stop_speedtest_progress(reset=False)
+        self.speedtest_progress_elapsed_ms = 0
+        self.speedtest_progress_total_ms = max(1, int(duration_seconds) * 1000)
+        if self.speedtest_progress_bar is not None:
+            self.speedtest_progress_bar.setValue(0)
+            self.speedtest_progress_bar.setFormat("Running... 0%")
+
+        self.speedtest_progress_timer = QTimer(self)
+        self.speedtest_progress_timer.setInterval(250)
+        self.speedtest_progress_timer.timeout.connect(self._update_speedtest_progress)
+        self.speedtest_progress_timer.start()
+
+    def _update_speedtest_progress(self):
+        self.speedtest_progress_elapsed_ms += 250
+        pct = min(100, int((self.speedtest_progress_elapsed_ms / self.speedtest_progress_total_ms) * 100))
+        if self.speedtest_progress_bar is not None:
+            self.speedtest_progress_bar.setValue(pct)
+            self.speedtest_progress_bar.setFormat("Running... %p%" if pct < 100 else "Finishing...")
+
+    def _stop_speedtest_progress(self, reset: bool):
+        if self.speedtest_progress_timer is not None:
+            self.speedtest_progress_timer.stop()
+            self.speedtest_progress_timer.deleteLater()
+            self.speedtest_progress_timer = None
+
+        if self.speedtest_progress_bar is not None:
+            if reset:
+                self.speedtest_progress_bar.setValue(0)
+                self.speedtest_progress_bar.setFormat("Ready")
+            else:
+                self.speedtest_progress_bar.setValue(100)
+
     def start_speed_test(self):
         """Run a manual LibreSpeed CLI test in the background."""
         if self.speedtest_worker is not None and self.speedtest_worker.isRunning():
@@ -1118,10 +1192,11 @@ class PingerApp(QWidget):
             return
 
         self._set_speedtest_status("Running speed test. This may use significant bandwidth...")
-        self.speedtest_run_btn.setEnabled(False)
         server_id = self.speedtest_server_combo.currentData() if self.speedtest_server_combo is not None else None
         duration = self.speedtest_duration_spin.value() if self.speedtest_duration_spin is not None else 15
         share = self.speedtest_share_check.isChecked() if self.speedtest_share_check is not None else False
+        self._set_speedtest_controls_enabled(False)
+        self._start_speedtest_progress(duration)
         self.speedtest_worker = SpeedTestWorker(executable, server_id=server_id, duration=duration, share=share)
         self.speedtest_worker.result_ready.connect(self._set_speedtest_result)
         self.speedtest_worker.error_ready.connect(self._set_speedtest_error)
@@ -1203,25 +1278,54 @@ class PingerApp(QWidget):
             "upload": self._format_mbps(data.get("upload")),
             "latency": "N/A" if data.get("ping") is None else f"{float(data.get('ping')):.1f} ms",
             "jitter": "N/A" if data.get("jitter") is None else f"{float(data.get('jitter')):.1f} ms",
-            "loss": "N/A (not reported by LibreSpeed)",
             "server": server_name,
             "server_url": server_url,
             "isp": isp,
-            "result": data.get("share") or "N/A",
+            "result": data.get("share") or (
+                "Unavailable from selected server" if self.speedtest_share_check is not None and self.speedtest_share_check.isChecked()
+                else "N/A"
+            ),
             "timestamp": self._format_timestamp(data.get("timestamp")),
             "data_used": f"Down {bytes_received} / Up {bytes_sent}",
         }
 
         for key, value in values.items():
             self.speedtest_labels[key].setText(value)
+        self._add_speedtest_history(values)
         self._set_speedtest_status("Speed test completed.")
+
+    def _add_speedtest_history(self, values: dict):
+        if self.speedtest_history_table is None:
+            return
+
+        row_values = [
+            values["timestamp"],
+            values["download"],
+            values["upload"],
+            values["latency"],
+            values["jitter"],
+            values["server"],
+            values["data_used"],
+        ]
+        self.speedtest_history_table.insertRow(0)
+        for col, value in enumerate(row_values):
+            self.speedtest_history_table.setItem(0, col, QTableWidgetItem(value))
+
+        while self.speedtest_history_table.rowCount() > 20:
+            self.speedtest_history_table.removeRow(self.speedtest_history_table.rowCount() - 1)
 
     def _set_speedtest_error(self, message: str):
         self._set_speedtest_status(f"Speed test failed: {message}")
 
     def _finish_speedtest(self):
-        if self.speedtest_run_btn is not None:
-            self.speedtest_run_btn.setEnabled(True)
+        self._stop_speedtest_progress(reset=False)
+        if self.speedtest_progress_bar is not None:
+            if self.speedtest_status_label is not None and self.speedtest_status_label.text().startswith("Speed test completed"):
+                self.speedtest_progress_bar.setValue(100)
+                self.speedtest_progress_bar.setFormat("Complete")
+            else:
+                self.speedtest_progress_bar.setFormat("Stopped")
+        self._set_speedtest_controls_enabled(True)
 
     def _refresh_health_status(self):
         """Update rolling RTT and jitter health guidance."""
