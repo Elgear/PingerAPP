@@ -19,6 +19,7 @@ import errno
 import ipaddress
 import concurrent.futures
 import ssl
+import textwrap
 
 from collections import deque
 from datetime import datetime
@@ -99,6 +100,19 @@ def clean_probe_text(value, max_len=220):
     value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", value or "")
     value = re.sub(r"\s+", " ", value).strip()
     return value[:max_len]
+
+def wrapped_detail_text(value, width=70):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"\s+\|\s+", "\n", value)
+    lines = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        lines.extend(textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False) or [""])
+    return "\n".join(lines)
 
 def get_arp_mac(ip):
     if platform.system() != "Windows":
@@ -1973,7 +1987,8 @@ class PingerApp(QWidget):
         item.setText(6, "")
         item.setText(7, "")
         item.setText(8, latency)
-        item.setText(9, summary["details"])
+        item.setText(9, wrapped_detail_text(summary["details"]))
+        item.setToolTip(9, summary["details"])
         if summary["open"]:
             self._apply_tree_item_style(item, "Open")
         elif summary["alive"]:
@@ -2036,8 +2051,9 @@ class PingerApp(QWidget):
             result.get("service", ""),
             status,
             latency,
-            result.get("error", ""),
+            wrapped_detail_text(result.get("error", "")),
         ])
+        child.setToolTip(9, result.get("error", ""))
         self._apply_tree_item_style(child, status)
         host_item.addChild(child)
         self._update_host_summary_item(result.get("host", ""))
