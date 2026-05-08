@@ -1238,7 +1238,11 @@ class PingerApp(QWidget):
     def _start_speedtest_progress(self, duration_seconds: int):
         self._stop_speedtest_progress(reset=False)
         self.speedtest_progress_elapsed_ms = 0
-        self.speedtest_progress_total_ms = max(1, int(duration_seconds) * 1000)
+        # LibreSpeed's duration covers the transfer phase, not server selection,
+        # ping/jitter probes, setup, and result parsing. Add a conservative
+        # overhead so the progress bar tracks wall-clock runtime more closely.
+        estimated_total_seconds = int(duration_seconds) + 25
+        self.speedtest_progress_total_ms = max(1, estimated_total_seconds * 1000)
         if self.speedtest_progress_bar is not None:
             self.speedtest_progress_bar.setValue(0)
             self.speedtest_progress_bar.setFormat("Running... 0%")

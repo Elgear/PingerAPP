@@ -13,6 +13,7 @@
 - Auto-load the LibreSpeed server list when the Speed Test window opens, clear stale current results before each run, and show a clearer error when a selected server returns no result.
 - Added public ISP lookup, hostname, and primary MAC address to Host Info, and reused the ISP lookup in the Speed Test window when LibreSpeed does not provide ISP data.
 - Changed the Speed Test progress bar to update once per second against the configured test duration.
+- Added LibreSpeed runtime overhead to the Speed Test progress estimate so the bar better matches total wall-clock runtime.
 
 ## 2026-05-07
 
