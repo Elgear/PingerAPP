@@ -38,6 +38,7 @@
 - Reworked Network Scanner layout into Target, Scan, and Display groups with one help button per group, named port presets plus exact-port preview, wrapped grouped results, and separate Host State and Port State columns.
 - Moved Network Scanner group help beside section labels and split host summaries into separate Host State and Open Ports columns before per-port details.
 - Moved Network Scanner section labels and help buttons outside the framed control contents so the boxes contain only controls.
+- Added extra cell and header padding to the Network Scanner results table so auto-sized columns are easier to read.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 

@@ -1674,6 +1674,10 @@ class PingerApp(QWidget):
             self.port_table.setSelectionBehavior(QTreeWidget.SelectRows)
             self.port_table.setUniformRowHeights(False)
             self.port_table.setWordWrap(True)
+            self.port_table.setStyleSheet(
+                "QTreeWidget::item { padding: 2px 12px 2px 4px; } "
+                "QHeaderView::section { padding: 3px 12px 3px 4px; }"
+            )
             ph = self.port_table.header()
             ph.setSectionResizeMode(0, QHeaderView.ResizeToContents)
             ph.setSectionResizeMode(1, QHeaderView.ResizeToContents)
