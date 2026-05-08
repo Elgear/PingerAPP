@@ -29,6 +29,7 @@
 - Replaced embedded DNS and Traceroute side panels with Tools launcher buttons and separate DNS / WHOIS and Traceroute diagnostic windows.
 - Expanded DNS / WHOIS with record lookup, reverse lookup, and optional IP/ASN/ISP metadata.
 - Expanded Traceroute with target, max-hop, timeout, structured hop table, and raw output controls.
+- Moved Speed Test from the Ping Panel into the Tools launcher.
 - Added packaging notes in `README.md`.
 - Kept changes tracked in `CHANGELOG.md` and future work in `ROADMAP.md`.
 

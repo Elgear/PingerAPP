@@ -807,18 +807,10 @@ class PingerApp(QWidget):
         elapsed_h.addLayout(v)
         elapsed_group.setLayout(elapsed_h)
 
-        speedtest_group = QGroupBox("Speed Test")
-        speedtest_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        stg = QHBoxLayout()
-        stg.setContentsMargins(8,8,8,8)
-        stg.addWidget(self.speedtest_btn, 0, Qt.AlignCenter)
-        speedtest_group.setLayout(stg)
-
         ping_h.addWidget(target_group)
         ping_h.addWidget(live_group)
         ping_h.addStretch(1)
         ping_h.addWidget(elapsed_group)
-        ping_h.addWidget(speedtest_group)
         ping_row.setLayout(ping_h)
 
         
@@ -963,6 +955,7 @@ class PingerApp(QWidget):
         tools_layout = QVBoxLayout()
         tools_layout.setContentsMargins(8,8,8,8)
         tools_layout.setSpacing(10)
+        tools_layout.addWidget(self.speedtest_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.dns_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.trace_tool_btn, 0, Qt.AlignCenter)
         tools_layout.addWidget(self.alerts_btn, 0, Qt.AlignCenter)
