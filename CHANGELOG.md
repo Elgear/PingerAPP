@@ -42,6 +42,7 @@
 - Added a LAN Throughput tool using optional iperf3 client/server mode to separate local LAN bottlenecks from internet/ISP speed problems.
 - Added LAN Throughput to the Report tool, Help documentation, README, and packaging notes.
 - Bundled iperf3 3.21 for Windows x64 with Cygwin runtime DLL, checksums, source records, and license notices.
+- Improved LAN Throughput guidance and iperf3 connection errors so the gateway/router is not presented as the default test server.
 
 ## 2026-05-07
 

@@ -1192,7 +1192,7 @@ class LanThroughputWorker(QThread):
 
         output = (completed.stdout or "").strip()
         if completed.returncode != 0:
-            message = (completed.stderr or output or "iperf3 failed.").strip()
+            message = self._format_iperf_error(output, completed.stderr)
             self.error_ready.emit(message)
             return
 
@@ -1225,6 +1225,31 @@ class LanThroughputWorker(QThread):
             "raw": json.dumps(data, indent=2),
         }
         self.result_ready.emit(result)
+
+    def _format_iperf_error(self, stdout: str, stderr: str):
+        error_text = ""
+        if stdout:
+            try:
+                parsed = json.loads(stdout)
+                error_text = str(parsed.get("error", "")).strip()
+            except json.JSONDecodeError:
+                error_text = stdout.strip()
+        if not error_text:
+            error_text = (stderr or "iperf3 failed.").strip()
+
+        lower = error_text.lower()
+        if "unable to connect to server" in lower or "connection timed out" in lower:
+            return (
+                f"Could not connect to iperf3 server at {self.host}:{self.port}. "
+                "Start the LAN Throughput server on another PC, enter that PC's IP address here, "
+                "and allow the selected port through Windows Firewall. Most gateways/routers do not run iperf3."
+            )
+        if "connection refused" in lower:
+            return (
+                f"{self.host}:{self.port} is reachable but no iperf3 server accepted the connection. "
+                "Start iperf3 server mode on that device or choose the port used by the server."
+            )
+        return error_text
 
 
 class SpeedTestServerListWorker(QThread):
@@ -2950,8 +2975,8 @@ class PingerApp(QWidget):
             client_grid = QGridLayout()
             client_grid.setHorizontalSpacing(8)
             client_grid.setVerticalSpacing(8)
-            self.lan_host_input = QLineEdit(self.gateway_label.text().strip() or self.host_input.text().strip())
-            self.lan_host_input.setPlaceholderText("IP or hostname of iperf3 server")
+            self.lan_host_input = QLineEdit()
+            self.lan_host_input.setPlaceholderText("IP of another PC running LAN Throughput server")
             self.lan_host_input.setMinimumWidth(320)
             self.lan_port_spin = QSpinBox()
             self.lan_port_spin.setRange(1, 65535)
@@ -2964,16 +2989,22 @@ class PingerApp(QWidget):
             self.lan_direction_combo.addItems(["Upload to server", "Download from server"])
             self.lan_run_btn = QPushButton("Run LAN Test")
             self.lan_run_btn.clicked.connect(self.start_lan_throughput_test)
+            client_hint = QLabel(
+                "Use another PC on the LAN as the server. Do not use the gateway/router IP unless it is actually running iperf3."
+            )
+            client_hint.setWordWrap(True)
+            client_hint.setStyleSheet("QLabel { color: #5f6368; }")
 
             client_grid.addWidget(QLabel("Server"), 0, 0)
             client_grid.addWidget(self.lan_host_input, 0, 1, 1, 5)
-            client_grid.addWidget(QLabel("Port"), 1, 0)
-            client_grid.addWidget(self.lan_port_spin, 1, 1)
-            client_grid.addWidget(QLabel("Duration"), 1, 2)
-            client_grid.addWidget(self.lan_duration_spin, 1, 3)
-            client_grid.addWidget(QLabel("Direction"), 1, 4)
-            client_grid.addWidget(self.lan_direction_combo, 1, 5)
-            client_grid.addWidget(self.lan_run_btn, 1, 6)
+            client_grid.addWidget(client_hint, 1, 0, 1, 7)
+            client_grid.addWidget(QLabel("Port"), 2, 0)
+            client_grid.addWidget(self.lan_port_spin, 2, 1)
+            client_grid.addWidget(QLabel("Duration"), 2, 2)
+            client_grid.addWidget(self.lan_duration_spin, 2, 3)
+            client_grid.addWidget(QLabel("Direction"), 2, 4)
+            client_grid.addWidget(self.lan_direction_combo, 2, 5)
+            client_grid.addWidget(self.lan_run_btn, 2, 6)
             client_grid.setColumnStretch(1, 1)
             client_group.setLayout(client_grid)
             layout.addWidget(client_group)
@@ -3001,6 +3032,7 @@ class PingerApp(QWidget):
 
             self.lan_status_label = QLabel("Ready")
             self.lan_status_label.setAlignment(Qt.AlignCenter)
+            self.lan_status_label.setWordWrap(True)
             self.lan_status_label.setStyleSheet(
                 "QLabel { background: #eef2f7; color: #3c4043; border: 1px solid #b7c0cc; "
                 "border-radius: 4px; padding: 8px; font-weight: bold; }"
@@ -3060,8 +3092,6 @@ class PingerApp(QWidget):
 
             self.lan_window.setLayout(layout)
 
-        if self.lan_host_input is not None and not self.lan_host_input.text().strip():
-            self.lan_host_input.setText(self.gateway_label.text().strip() or self.host_input.text().strip())
         self.lan_window.show()
         self.lan_window.raise_()
         self.lan_window.activateWindow()
@@ -3922,6 +3952,7 @@ class PingerApp(QWidget):
             <li>Uses iperf3 to measure local network throughput between two devices on your LAN.</li>
             <li>PingerApp includes iperf3 at <code>tools/iperf3/iperf3.exe</code> and can also use iperf3 from PATH.</li>
             <li>On one machine, open LAN Throughput and click <b>Start Server</b>. On the other machine, enter the server machine IP and click <b>Run LAN Test</b>.</li>
+            <li>Do not use the gateway/router IP unless that device is actually running iperf3. Most home routers do not.</li>
             <li><b>Upload to server</b> sends traffic from this PC to the server. <b>Download from server</b> uses iperf3 reverse mode.</li>
             <li>A wired gigabit LAN usually lands near 900 Mbps or higher. A result around 100 Mbps points to cable, port, dock, adapter, or negotiation limits.</li>
             <li>If LAN throughput is gigabit-class but internet Speed Test is low, focus on router WAN, ISP profile, speed test server, or congestion.</li>

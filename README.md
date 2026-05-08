@@ -52,7 +52,7 @@ The LAN Throughput window uses the bundled iperf3 executable at:
 tools/iperf3/iperf3.exe
 ```
 
-The app also falls back to `iperf3` on `PATH` if the bundled executable is not present. Run the iperf3 server on one local machine and the client test from another machine to separate LAN, cable, switch, Wi-Fi, or adapter bottlenecks from ISP/WAN speed problems.
+The app also falls back to `iperf3` on `PATH` if the bundled executable is not present. Run the iperf3 server on one local machine and the client test from another machine to separate LAN, cable, switch, Wi-Fi, or adapter bottlenecks from ISP/WAN speed problems. Do not use the gateway/router IP unless that device is actually running iperf3; most home routers do not.
 
 The bundled Windows build is iperf3 3.21 and includes `cygwin1.dll`. Source, license, and checksum records are in `tools/iperf3/VERSION.txt`, `tools/iperf3/CHECKSUMS.txt`, and the `tools/iperf3/LICENSE.*.txt` files.
 
